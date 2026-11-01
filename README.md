@@ -1,34 +1,25 @@
-# Audio Quote - 
-### Share just the part of a long voice message that matters
+# Quick Edit Last Message
 
-## Platform - Android
+- Long-press the empty input field and swipe up to open editing for the latest editable outgoing message.
+- Works in personal chats and Saved Messages.
+- Does not trigger in groups, channels, secret chats, or while another message is being edited.
 
+## Why
 
-[demo.MOV](videos/demo.mp4)
+This feature reduces the number of steps needed to edit the last message from two actions to a single swipe-up gesture, making quick corrections faster and more convenient.
 
-![4-reply-message-cell.png](docs/images/4-reply-message-cell.png)
+![demo.png](docs/images/demo.png)
 
-## Flow: Voice Range Select
-1. The user long-presses a voice message or its waveform.
-![1-voice-message-menu.png](docs/images/1-voice-message-menu.png)
+[after.mp4](docs/videos/after.mp4)
 
-2. Range selection mode opens. A highlighted segment appears around the touch position with start and end handles.
-![2-select-range.png](docs/images/2-select-range.png)
-
-3. The user can:
-    - drag the left and right handles to resize the range;
-    - drag inside the selection to move the entire range;
-    - preview the selected fragment.
-   
-4. After selecting the range, the user taps **Reply**.
-![3-write-reply-text.png](docs/images/3-write-reply-text.png)
-
-5. The selected range is stored in the reply as a reference to the original voice message with `start` and `end` positions.
-6. The recipient sees a compact preview of the selected audio range in the reply header: the sender’s name, quote icon, and waveform fragment.
-7. Tapping the preview opens the original voice message and starts playback from the beginning of the selected range.
-8. The selected fragment is not copied or sent as a separate audio file. Only the range boundaries are transmitted, and playback uses the original voice message.
+[before.mp4](docs/videos/before.mp4)
 
 
+
+## Changes
+
+- [ChatActivityEnterView.java (line 5411)](TMessagesProj/src/main/java/org/telegram/ui/Components/ChatActivityEnterView.java:5411)
+- [ChatActivity.java (line 2108)](TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java:2108)
 
 # How to apply
 
@@ -37,14 +28,17 @@ Based on official drklo/telegram client
 git clone --recursive --shallow-submodules https://github.com/DrKLO/Telegram.git Telegram
 cd telegram
 git checkout --detach 3de37c8cfb039452be7398909461da6288babf15
+
+git clone -b feature/quick-edit-last-message https://github.com/col3name/timequoute-voice-message patches
 ```
 
 Apply patches
 ```
+
 git submodule update --init --recursive
 
-git apply --check /Users/mikha/Desktop/github/android/Telegram/timequote_changes.patch
-git apply /Users/mikha/Desktop/github/android/Telegram/timequote_changes.patch
+git apply --check ./patches/quick-edit-last-message.patch
+git apply ./patches/quick-edit-last-message.patch
 
 git diff --stat
 ```

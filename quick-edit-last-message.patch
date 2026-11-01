@@ -1,0 +1,118 @@
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
+index 87afb3944..fcbf883f1 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
+@@ -2105,6 +2105,27 @@ public class ChatActivity extends BaseFragment implements
+             }
+         }
+ 
++        @Override
++        public void onSwipeUpFromEmptyInput() {
++            if (currentUser == null || currentChat != null || currentEncryptedChat != null || chatMode != MODE_DEFAULT || chatActivityEnterView.isEditingMessage()) {
++                return;
++            }
++
++            MessageObject lastEditableMessage = null;
++            for (int i = 0; i < messages.size(); i++) {
++                MessageObject messageObject = messages.get(i);
++                if (messageObject == null || messageObject.type == MessageObject.TYPE_DATE || !messageObject.isOutOwner() || messageObject.isSending() || messageObject.isSendError() || messageObject.isEditing() || !messageObject.canEditMessage(null)) {
++                    continue;
++                }
++                if (lastEditableMessage == null || messageObject.messageOwner.date > lastEditableMessage.messageOwner.date || messageObject.messageOwner.date == lastEditableMessage.messageOwner.date && messageObject.getId() > lastEditableMessage.getId()) {
++                    lastEditableMessage = messageObject;
++                }
++            }
++            if (lastEditableMessage != null) {
++                startEditingMessageObject(lastEditableMessage);
++            }
++        }
++
+         @Override
+         public void didPressStreamingStop() {
+             BotForumHelper.getInstance(currentAccount).stopStreaming(dialog_id, (int) getTopicId());
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/ChatActivityEnterView.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/ChatActivityEnterView.java
+index 16a3823b5..15e8df90a 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/Components/ChatActivityEnterView.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/ChatActivityEnterView.java
+@@ -422,6 +422,10 @@ public class ChatActivityEnterView extends FrameLayout implements
+ 
+         }
+ 
++        default void onSwipeUpFromEmptyInput() {
++
++        }
++
+         default boolean onceVoiceAvailable() {
+             return false;
+         }
+@@ -5316,6 +5320,24 @@ public class ChatActivityEnterView extends FrameLayout implements
+         }
+ 
+         CanvasButton canvasButton;
++        private float swipeDownX;
++        private float swipeDownY;
++        private boolean swipeFromEmptyInput;
++        private boolean swipeLongPressed;
++        private final Runnable swipeLongPressRunnable = () -> {
++            if (swipeFromEmptyInput) {
++                swipeLongPressed = true;
++            }
++        };
++
++        protected boolean isSwipeUpFromEmptyInput(MotionEvent event) {
++            if (event.getAction() != MotionEvent.ACTION_UP || !swipeFromEmptyInput || !swipeLongPressed) {
++                return false;
++            }
++            float dx = event.getX() - swipeDownX;
++            float dy = event.getY() - swipeDownY;
++            return dy < -AndroidUtilities.touchSlop && Math.abs(dy) > Math.abs(dx);
++        }
+ 
+         @Override
+         protected void onScrollChanged(int horiz, int vert, int oldHoriz, int oldVert) {
+@@ -5405,6 +5427,33 @@ public class ChatActivityEnterView extends FrameLayout implements
+             if (stickersDragging || stickersExpansionAnim != null) {
+                 return false;
+             }
++            if (event.getAction() == MotionEvent.ACTION_DOWN) {
++                swipeDownX = event.getX();
++                swipeDownY = event.getY();
++                swipeFromEmptyInput = TextUtils.isEmpty(getText());
++                swipeLongPressed = false;
++                if (swipeFromEmptyInput) {
++                    postDelayed(swipeLongPressRunnable, ViewConfiguration.getLongPressTimeout());
++                }
++            } else if (event.getAction() == MotionEvent.ACTION_MOVE && swipeFromEmptyInput && !swipeLongPressed) {
++                if (Math.abs(event.getX() - swipeDownX) > AndroidUtilities.touchSlop || Math.abs(event.getY() - swipeDownY) > AndroidUtilities.touchSlop) {
++                    swipeFromEmptyInput = false;
++                    removeCallbacks(swipeLongPressRunnable);
++                }
++            } else if (event.getAction() == MotionEvent.ACTION_UP && swipeFromEmptyInput) {
++                removeCallbacks(swipeLongPressRunnable);
++                if (isSwipeUpFromEmptyInput(event)) {
++                    if (delegate != null) {
++                        delegate.onSwipeUpFromEmptyInput();
++                    }
++                    swipeFromEmptyInput = false;
++                    return true;
++                }
++            } else if (event.getAction() == MotionEvent.ACTION_CANCEL) {
++                swipeFromEmptyInput = false;
++                swipeLongPressed = false;
++                removeCallbacks(swipeLongPressRunnable);
++            }
+             if (!sendPlainEnabled && !isEditingMessage()) {
+                 if (canvasButton == null) {
+                     canvasButton = new CanvasButton(this);
+@@ -5736,6 +5785,11 @@ public class ChatActivityEnterView extends FrameLayout implements
+                     return clickMaybe;
+                 } else {
+                     if (event.getAction() == MotionEvent.ACTION_DOWN) {
++                        if (!TextUtils.isEmpty(getText()) && delegate != null) {
++                            fixHandlesColor();
++                            delegate.onKeyboardRequested();
++                        }
++                    } else if (event.getAction() == MotionEvent.ACTION_UP && TextUtils.isEmpty(getText()) && !isSwipeUpFromEmptyInput(event)) {
+                         if (delegate != null) {
+                             fixHandlesColor();
+                             delegate.onKeyboardRequested();
