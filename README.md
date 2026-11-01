@@ -8,11 +8,18 @@
 
 This feature reduces the number of steps needed to edit the last message from two actions to a single swipe-up gesture, making quick corrections faster and more convenient.
 
-![demo.png](docs/images/demo.png)
+![Demo](docs/images/demo.png)
 
-[after.mp4](docs/videos/after.mp4)
+### Demo
 
-[before.mp4](docs/videos/before.mp4)
+![After](docs/videos/after.gif)
+
+![Before](docs/videos/before.gif)
+
+Full-resolution videos:
+
+- [after.mp4](docs/videos/after.mp4)
+- [before.mp4](docs/videos/before.mp4)
 
 
 
