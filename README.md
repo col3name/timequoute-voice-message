@@ -8,11 +8,13 @@
 
 [Watch the demo](docs/videos/fast-search-user-messages.mp4)
 
-## Task description
+## Search by Sender
 
-In a group chat, long-press a member's avatar next to any message to open the avatar context menu. Select **Search Messages** to immediately open message search with that sender selected.
+Search for an author's messages directly from the avatar context menu.
 
-The user does not need to open the search filters and select the sender manually. The search request uses the existing `messages.search` API and passes the selected sender through `from_id`.
+In a group chat, long-press the photo next to a message to open the localized context menu and select **Find All Messages from This Author**.
+
+Message search opens immediately with the sender selected. The user does not need to configure the sender filter manually. The search request uses the existing `messages.search` API and passes the selected sender through `from_id`.
 
 ## User flow
 
