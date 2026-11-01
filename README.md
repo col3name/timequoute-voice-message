@@ -6,7 +6,7 @@
 
 ## Android
 
-[Watch the demo](docs/videos/fast-search-user-messages.mp4)
+![Fast search by sender demo](docs/videos/fast-search-user-messages.gif)
 
 ## Search by Sender
 
