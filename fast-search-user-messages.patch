@@ -1,5 +1,5 @@
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
-index 87afb3944..8ee0ea914 100644
+index 87afb39448181f4d9ff735e8f493ea5935072aee..8ee0ea9147efda37b815291a3b6df4e911e47c56 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
 @@ -40032,7 +40032,7 @@ public class ChatActivity extends BaseFragment implements
@@ -21,7 +21,7 @@ index 87afb3944..8ee0ea914 100644
                  final AvatarPreviewer.MenuItem[] menuItems = new AvatarPreviewer.MenuItem[1 + (openChannel ? 1 : 0) + (enableMention ? 1 : 0) + (enableSearchMessages ? 1 : 0)];
                  int a = 0;
 diff --git a/TMessagesProj/src/main/res/values-ru/strings.xml b/TMessagesProj/src/main/res/values-ru/strings.xml
-index 24c562920..6ec14d0ce 100644
+index 24c5629206c22db9e0f5e0574ec9a933f7834d55..6ec14d0cee29b5a29ff06822d7ec146279eaffb7 100644
 --- a/TMessagesProj/src/main/res/values-ru/strings.xml
 +++ b/TMessagesProj/src/main/res/values-ru/strings.xml
 @@ -7,6 +7,7 @@
