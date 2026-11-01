@@ -1,0 +1,41 @@
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
+index 87afb3944..8ee0ea914 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
+@@ -40032,7 +40032,7 @@ public class ChatActivity extends BaseFragment implements
+         public boolean didLongPressUserAvatar(ChatMessageCell cell, TLRPC.User user, float touchX, float touchY) {
+             if (isAvatarPreviewerEnabled()) {
+                 final boolean enableMention = currentChat != null && (bottomChannelButtonsLayout == null || bottomChannelButtonsLayout.getVisibility() != View.VISIBLE) && (bottomOverlay == null || bottomOverlay.getVisibility() != View.VISIBLE);
+-                final boolean enableSearchMessages = currentChat != null && (threadMessageId == 0 || isTopic) && (!ChatObject.isChannel(currentChat) || currentChat.megagroup);
++                final boolean enableSearchMessages = currentChat != null && (threadMessageId == 0 || isTopic || isComments) && (!ChatObject.isChannel(currentChat) || currentChat.megagroup);
+                 final AvatarPreviewer.MenuItem[] menuItems = new AvatarPreviewer.MenuItem[2 + (enableMention ? 1 : 0) + (enableSearchMessages ? 1 : 0)];
+                 int a = 0;
+                 menuItems[a++] = AvatarPreviewer.MenuItem.OPEN_PROFILE;
+@@ -40155,7 +40155,7 @@ public class ChatActivity extends BaseFragment implements
+         public boolean didLongPressChannelAvatar(ChatMessageCell cell, TLRPC.Chat chat, int postId, float touchX, float touchY) {
+             if (isAvatarPreviewerEnabled()) {
+                 final boolean enableMention = !TextUtils.isEmpty(ChatObject.getPublicUsername(chat)) && currentChat != null && (bottomChannelButtonsLayout == null || bottomChannelButtonsLayout.getVisibility() != View.VISIBLE) && (bottomOverlay == null || bottomOverlay.getVisibility() != View.VISIBLE);
+-                final boolean enableSearchMessages = currentChat != null && (threadMessageId == 0 || isTopic) && (!ChatObject.isChannel(currentChat) || currentChat.megagroup);
++                final boolean enableSearchMessages = currentChat != null && (threadMessageId == 0 || isTopic || isComments) && (!ChatObject.isChannel(currentChat) || currentChat.megagroup);
+                 final boolean openChannel = currentChat == null || currentChat.id != chat.id || isThreadChat();
+                 final AvatarPreviewer.MenuItem[] menuItems = new AvatarPreviewer.MenuItem[1 + (openChannel ? 1 : 0) + (enableMention ? 1 : 0) + (enableSearchMessages ? 1 : 0)];
+                 int a = 0;
+diff --git a/TMessagesProj/src/main/res/values-ru/strings.xml b/TMessagesProj/src/main/res/values-ru/strings.xml
+index 24c562920..6ec14d0ce 100644
+--- a/TMessagesProj/src/main/res/values-ru/strings.xml
++++ b/TMessagesProj/src/main/res/values-ru/strings.xml
+@@ -7,6 +7,7 @@
+     <string name="LanguageNameInEnglish">Russian</string>
+     <string name="LanguageCode">ru</string>
+     <string name="ContinueOnThisLanguage">Продолжить на русском</string>
++    <string name="AvatarPreviewSearchMessages">Найти все сообщения</string>
+     <!--signin view-->
+     <string name="YourPhone">Ваш телефон</string>
+     <string name="StartText">Проверьте код страны и введите свой номер телефона.</string>
+@@ -263,4 +264,4 @@
+     <string name="RemindTodayAt">\'Отправить сегодня в\' HH:mm</string>
+     <string name="RemindDayAt">\'Отправить\' d MMM \'в\' HH:mm</string>
+     <string name="RemindDayYearAt">\'Напомнить\' d MMM yyyy \'в\' HH:mm</string>
+-</resources>
+\ No newline at end of file
++</resources>

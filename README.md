@@ -1,50 +1,47 @@
-# Audio Quote - 
-### Share just the part of a long voice message that matters
+# Fast Search by Sender
 
-## Platform - Android
+### Find all messages from a group member directly from the avatar context menu
 
+![Fast search by sender preview](docs/images/fast-search-user-messages.png)
 
-[demo.MOV](videos/demo.mp4)
+## Android
 
-![4-reply-message-cell.png](docs/images/4-reply-message-cell.png)
+[Watch the demo](docs/videos/fast-search-user-messages.mp4)
 
-## Flow: Voice Range Select
-1. The user long-presses a voice message or its waveform.
-![1-voice-message-menu.png](docs/images/1-voice-message-menu.png)
+## Task description
 
-2. Range selection mode opens. A highlighted segment appears around the touch position with start and end handles.
-![2-select-range.png](docs/images/2-select-range.png)
+In a group chat, long-press a member's avatar next to any message to open the avatar context menu. Select **Search Messages** to immediately open message search with that sender selected.
 
-3. The user can:
-    - drag the left and right handles to resize the range;
-    - drag inside the selection to move the entire range;
-    - preview the selected fragment.
-   
-4. After selecting the range, the user taps **Reply**.
-![3-write-reply-text.png](docs/images/3-write-reply-text.png)
+The user does not need to open the search filters and select the sender manually. The search request uses the existing `messages.search` API and passes the selected sender through `from_id`.
 
-5. The selected range is stored in the reply as a reference to the original voice message with `start` and `end` positions.
-6. The recipient sees a compact preview of the selected audio range in the reply header: the sender’s name, quote icon, and waveform fragment.
-7. Tapping the preview opens the original voice message and starts playback from the beginning of the selected range.
-8. The selected fragment is not copied or sent as a separate audio file. Only the range boundaries are transmitted, and playback uses the original voice message.
+## User flow
 
+1. Open a group chat.
+2. Long-press a member's avatar next to one of their messages.
+3. Select **Search Messages**.
+4. Telegram opens the search UI with the sender filter already applied.
 
+## Implementation
 
-# How to apply
+- `ChatActivity` adds the sender search action to the avatar context menu.
+- `AvatarPreviewer` supports the same action in the avatar preview menu.
+- `MediaDataController` reuses `messages.search` with `from_id`.
+- `MessagesSearchAdapter` displays the resulting messages.
+- The Russian localization uses **Найти все сообщения**.
 
-Based on official drklo/telegram client
-```
+## Patch
+
+The ready-to-apply patch is available at [`fast-search-user-messages.patch`](fast-search-user-messages.patch).
+
+## How to apply
+
+Based on the official DrKLO/Telegram client:
+
+```bash
 git clone --recursive --shallow-submodules https://github.com/DrKLO/Telegram.git Telegram
-cd telegram
+cd Telegram
 git checkout --detach 3de37c8cfb039452be7398909461da6288babf15
-```
-
-Apply patches
-```
 git submodule update --init --recursive
-
-git apply --check /Users/mikha/Desktop/github/android/Telegram/timequote_changes.patch
-git apply /Users/mikha/Desktop/github/android/Telegram/timequote_changes.patch
-
-git diff --stat
+git apply --check /path/to/fast-search-user-messages.patch
+git apply /path/to/fast-search-user-messages.patch
 ```
