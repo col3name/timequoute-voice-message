@@ -39,6 +39,11 @@ cd telegram
 git checkout --detach 3de37c8cfb039452be7398909461da6288babf15
 ```
 
+Download 
+```
+https://github.com/col3name/timequoute-voice-message/blob/main/timequote_changes.patch
+```
+
 Apply patches
 ```
 git submodule update --init --recursive
