@@ -1,6 +1,8 @@
 # Audio Quote - 
 ### Share just the part of a long voice message that matters
 
+Android Audio Quotes — Select and share only the relevant part of a long voice message instead of sending the entire recording.
+
 ## Platform - Android
 
 
