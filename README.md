@@ -11,9 +11,11 @@ This feature reduces the number of steps needed to edit the last message from tw
 ![Demo](docs/images/demo.png)
 
 ### Demo
+#### After
 
 ![After](docs/videos/after.gif)
 
+#### Before
 ![Before](docs/videos/before.gif)
 
 Full-resolution videos:
