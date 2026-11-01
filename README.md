@@ -43,8 +43,8 @@ Apply patches
 ```
 git submodule update --init --recursive
 
-git apply --check /Users/mikha/Desktop/github/android/Telegram/timequote_changes.patch
-git apply /Users/mikha/Desktop/github/android/Telegram/timequote_changes.patch
+git apply --check ./timequote_changes.patch
+git apply ./timequote_changes.patch
 
 git diff --stat
 ```
