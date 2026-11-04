@@ -93,6 +93,9 @@ The patch targets the official Telegram Android sources. No base commit is recor
 ```sh
 git clone --recursive --shallow-submodules https://github.com/DrKLO/Telegram.git Telegram
 cd Telegram
+
+git checkout --detach 3de37c8cfb039452be7398909461da6288babf15
+
 git apply --check /path/to/timequoute-voice-message/conditional-send.patch
 git apply /path/to/timequoute-voice-message/conditional-send.patch
 ```
