@@ -1,0 +1,717 @@
+diff --git a/TMessagesProj/build.gradle b/TMessagesProj/build.gradle
+index f9a3639a1..1bcc6f43e 100644
+--- a/TMessagesProj/build.gradle
++++ b/TMessagesProj/build.gradle
+@@ -50,6 +50,7 @@ dependencies {
+     implementation 'androidx.interpolator:interpolator:1.0.0'
+     implementation 'androidx.biometric:biometric:1.1.0'
+     implementation 'androidx.webkit:webkit:1.14.0'
++    implementation 'androidx.work:work-runtime:2.10.4'
+ 
+     implementation 'com.google.android.gms:play-services-cast-framework:21.4.0'
+     implementation "androidx.mediarouter:mediarouter:1.7.0"
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java b/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java
+index 071e9778b..31b2e91d2 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java
+@@ -645,6 +645,7 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
+         public TLRPC.BotInlineResult inlineResult;
+         public HashMap<String, String> params;
+         public boolean isVideo;
++        public boolean waitForWifi;
+         public boolean isLivePhoto;
+         public boolean discardLivePhoto;
+         public boolean canDeleteAfter;
+@@ -5022,6 +5023,12 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
+                 newMsg.flags |= TLRPC.MESSAGE_FLAG_HAS_BOT_ID;
+             }
+             newMsg.params = params;
++            if (sendMessageParams.deferUntilWifi) {
++                if (newMsg.params == null) {
++                    newMsg.params = new HashMap<>();
++                }
++                newMsg.params.put(ConditionalSend.PARAM_WAIT_FOR_WIFI, "1");
++            }
+             if (retryMessageObject == null || !retryMessageObject.resendAsIs) {
+                 if (quick_reply_shortcut != null) {
+                     newMsg.date = 0;
+@@ -6134,6 +6141,10 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
+                     if (retryMessageObject == null) {
+                         StarsController.getInstance(currentAccount).beforeSendingMessage(newMsgObj);
+                     }
++                    if (ConditionalSend.shouldWait(newMsg)) {
++                        ConditionalSend.schedule(currentAccount);
++                        return;
++                    }
+                     if (groupId != 0) {
+                         performSendDelayedMessage(delayedMessage);
+                     } else if (type == 1) {
+@@ -10839,6 +10850,54 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
+ 
+     @UiThread
+     public static void prepareSendingMedia(AccountInstance accountInstance, ArrayList<SendingMediaInfo> media, long dialogId, MessageObject replyToMsg, MessageObject replyToTopMsg, TL_stories.StoryItem storyItem, ChatActivity.ReplyQuote quote, boolean forceDocument, boolean groupMedia, MessageObject editingMessageObject, TLRPC.TL_inputPollAnswer pollToAddOptionMessageObject, boolean notify, int scheduleDate, int scheduleRepeatPeriod, int mode, boolean updateStikcersOrder, InputContentInfoCompat inputContent, SendMessageChatArguments sendMessageChatArguments, long effectId, boolean invertMedia, long payStars, long monoForumPeerId, MessageSuggestionParams suggestionParams, PollSendParams pollSendParams, boolean forcedPollDoNotSendFinal) {
++        prepareSendingMedia(accountInstance, media, dialogId, replyToMsg, replyToTopMsg, storyItem, quote, forceDocument, groupMedia, editingMessageObject, pollToAddOptionMessageObject, notify, scheduleDate, scheduleRepeatPeriod, mode, updateStikcersOrder, inputContent, sendMessageChatArguments, effectId, invertMedia, payStars, monoForumPeerId, suggestionParams, pollSendParams, forcedPollDoNotSendFinal, false);
++    }
++
++    @UiThread
++    private static void prepareSendingMedia(AccountInstance accountInstance, ArrayList<SendingMediaInfo> media, long dialogId, MessageObject replyToMsg, MessageObject replyToTopMsg, TL_stories.StoryItem storyItem, ChatActivity.ReplyQuote quote, boolean forceDocument, boolean groupMedia, MessageObject editingMessageObject, TLRPC.TL_inputPollAnswer pollToAddOptionMessageObject, boolean notify, int scheduleDate, int scheduleRepeatPeriod, int mode, boolean updateStikcersOrder, InputContentInfoCompat inputContent, SendMessageChatArguments sendMessageChatArguments, long effectId, boolean invertMedia, long payStars, long monoForumPeerId, MessageSuggestionParams suggestionParams, PollSendParams pollSendParams, boolean forcedPollDoNotSendFinal, boolean conditionalDecisionMade) {
++        final BaseFragment conditionalFragment = LaunchActivity.getSafeLastFragment();
++        final boolean groupMediaForConditional = groupMedia;
++        if (editingMessageObject == null && scheduleDate == 0 && !conditionalDecisionMade) {
++            SendingMediaInfo largeVideo = null;
++            for (SendingMediaInfo info : media) {
++                if ((info.isVideo || info.videoEditedInfo != null || ConditionalSend.isVideo(info.path, info.uri)) && ConditionalSend.isAboveThreshold(info.path, info.uri)) {
++                    largeVideo = info;
++                    break;
++                }
++            }
++            if (largeVideo != null) {
++                int conditionalMode = ConditionalSend.mode();
++                if (conditionalMode == ConditionalSend.WAIT_AUTOMATICALLY) {
++                    for (SendingMediaInfo info : media) {
++                        if ((info.isVideo || info.videoEditedInfo != null || ConditionalSend.isVideo(info.path, info.uri)) && ConditionalSend.isAboveThreshold(info.path, info.uri) && !ConditionalSend.isWifiConnected()) {
++                            info.waitForWifi = true;
++                        }
++                    }
++                } else if (conditionalMode == ConditionalSend.ASK && (conditionalFragment != null && conditionalFragment.getParentActivity() != null || LaunchActivity.instance != null)) {
++                    android.app.Activity activity = conditionalFragment != null && conditionalFragment.getParentActivity() != null ? conditionalFragment.getParentActivity() : LaunchActivity.instance;
++                    AlertDialog.Builder builder = new AlertDialog.Builder(activity);
++                    builder.setTitle(LocaleController.getString(R.string.ConditionalSendWifiTitle));
++                    builder.setMessage(LocaleController.formatString(R.string.ConditionalSendWifiMessage, AndroidUtilities.formatFileSize(ConditionalSend.getSize(largeVideo.path, largeVideo.uri))));
++                    builder.setPositiveButton(LocaleController.getString(R.string.ConditionalSendWhenWifi), (dialog, which) -> {
++                        for (SendingMediaInfo info : media) {
++                            if ((info.isVideo || info.videoEditedInfo != null || ConditionalSend.isVideo(info.path, info.uri)) && ConditionalSend.isAboveThreshold(info.path, info.uri)) {
++                                info.waitForWifi = true;
++                            }
++                        }
++                        prepareSendingMedia(accountInstance, media, dialogId, replyToMsg, replyToTopMsg, storyItem, quote, forceDocument, groupMediaForConditional, editingMessageObject, pollToAddOptionMessageObject, notify, scheduleDate, scheduleRepeatPeriod, mode, updateStikcersOrder, inputContent, sendMessageChatArguments, effectId, invertMedia, payStars, monoForumPeerId, suggestionParams, pollSendParams, forcedPollDoNotSendFinal, true);
++                    });
++                    builder.setNegativeButton(LocaleController.getString(R.string.ConditionalSendNow), (dialog, which) ->
++                        prepareSendingMedia(accountInstance, media, dialogId, replyToMsg, replyToTopMsg, storyItem, quote, forceDocument, groupMediaForConditional, editingMessageObject, pollToAddOptionMessageObject, notify, scheduleDate, scheduleRepeatPeriod, mode, updateStikcersOrder, inputContent, sendMessageChatArguments, effectId, invertMedia, payStars, monoForumPeerId, suggestionParams, pollSendParams, forcedPollDoNotSendFinal, true));
++                    AlertDialog dialog = builder.create();
++                    if (conditionalFragment != null) {
++                        conditionalFragment.showDialog(dialog);
++                    } else {
++                        dialog.show();
++                    }
++                    return;
++                }
++            }
++        }
+         if (media.isEmpty()) {
+             return;
+         }
+@@ -11172,6 +11231,9 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
+                             if (parentFinal != null) {
+                                 params.put("parentObject", parentFinal);
+                             }
++                            if (info.waitForWifi) {
++                                params.put(ConditionalSend.PARAM_WAIT_FOR_WIFI, "1");
++                            }
+                             if (groupMediaFinal) {
+                                 mediaCount++;
+                                 params.put("groupId", "" + groupId);
+@@ -11466,6 +11528,7 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
+                                     sendMessageParams.payStars = payStars;
+                                     sendMessageParams.monoForumPeer = monoForumPeerId;
+                                     sendMessageParams.suggestionParams = suggestionParams;
++                                    sendMessageParams.deferUntilWifi = info.waitForWifi;
+                                     sendMessageParams.isLivePhoto = info.isLivePhoto;
+                                     sendMessageParams.livePhotoTimestamp = info.livePhotoTimestampUs / 1000L;
+                                     sendMessageParams.pollSendParams = pollSendParams;
+@@ -12053,6 +12116,10 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
+     }
+ 
+     public static void prepareSendingVideo(AccountInstance accountInstance, String videoPath, VideoEditedInfo info, String coverPath, TLRPC.Photo coverPhoto, long dialogId, MessageObject replyToMsg, MessageObject replyToTopMsg, TL_stories.StoryItem storyItem, ChatActivity.ReplyQuote quote, ArrayList<TLRPC.MessageEntity> entities, int ttl, MessageObject editingMessageObject, boolean notify, int scheduleDate, int scheduleRepeatPeriod, boolean forceDocument, boolean hasMediaSpoilers, CharSequence caption, SendMessageChatArguments sendMessageChatArguments, long effectId, long stars, long monoForumPeerId, MessageSuggestionParams suggestionParams, boolean invertMedia) {
++        prepareSendingVideo(accountInstance, videoPath, info, coverPath, coverPhoto, dialogId, replyToMsg, replyToTopMsg, storyItem, quote, entities, ttl, editingMessageObject, notify, scheduleDate, scheduleRepeatPeriod, forceDocument, hasMediaSpoilers, caption, sendMessageChatArguments, effectId, stars, monoForumPeerId, suggestionParams, invertMedia, false);
++    }
++
++    public static void prepareSendingVideo(AccountInstance accountInstance, String videoPath, VideoEditedInfo info, String coverPath, TLRPC.Photo coverPhoto, long dialogId, MessageObject replyToMsg, MessageObject replyToTopMsg, TL_stories.StoryItem storyItem, ChatActivity.ReplyQuote quote, ArrayList<TLRPC.MessageEntity> entities, int ttl, MessageObject editingMessageObject, boolean notify, int scheduleDate, int scheduleRepeatPeriod, boolean forceDocument, boolean hasMediaSpoilers, CharSequence caption, SendMessageChatArguments sendMessageChatArguments, long effectId, long stars, long monoForumPeerId, MessageSuggestionParams suggestionParams, boolean invertMedia, boolean waitForWifi) {
+         if (videoPath == null || videoPath.length() == 0) {
+             return;
+         }
+@@ -12242,6 +12309,9 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
+                 if (parentFinal != null) {
+                     params.put("parentObject", parentFinal);
+                 }
++                if (waitForWifi) {
++                    params.put(ConditionalSend.PARAM_WAIT_FOR_WIFI, "1");
++                }
+                 AndroidUtilities.runOnUIThread(() -> {
+                     if (thumbFinal != null && thumbKeyFinal != null) {
+                         ImageLoader.getInstance().putImageToCache(new BitmapDrawable(thumbFinal), thumbKeyFinal, false);
+@@ -12259,6 +12329,7 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
+                         sendMessageParams.monoForumPeer = monoForumPeerId;
+                         sendMessageParams.suggestionParams = suggestionParams;
+                         sendMessageParams.invert_media = invertMedia;
++                        sendMessageParams.deferUntilWifi = waitForWifi;
+                         accountInstance.getSendMessagesHelper().sendMessage(sendMessageParams);
+                     }
+                 });
+@@ -12307,6 +12378,7 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
+         public ChatActivity.ReplyQuote replyQuote;
+         public SendMessageChatArguments sendMessageChatArguments;
+         public boolean invert_media;
++        public boolean deferUntilWifi;
+         @Deprecated // use SendMessageChatArguments
+         public String quick_reply_shortcut;
+         @Deprecated // use SendMessageChatArguments
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java b/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java
+index bc0affb03..1ad1d9fba 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java
+@@ -18465,7 +18465,7 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+                 signString = null;
+             }
+         }
+-        String timeString;
++        CharSequence timeString;
+         TLRPC.User author = null;
+         if (currentMessageObject.isFromUser()) {
+             author = MessagesController.getInstance(currentAccount).getUser(fromId);
+@@ -18517,6 +18517,14 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+         } else {
+             timeString = LocaleController.getInstance().getFormatterDay().format((long) (messageObject.messageOwner.date) * 1000);
+         }
++        if (messageObject.isSending() && org.telegram.messenger.ConditionalSend.shouldWait(messageObject.messageOwner)) {
++            SpannableStringBuilder status = new SpannableStringBuilder(" ");
++            ColoredImageSpan uploadSpan = new ColoredImageSpan(R.drawable.msg_mini_upload, ColoredImageSpan.ALIGN_CENTER);
++            uploadSpan.setSize(dp(12));
++            status.setSpan(uploadSpan, 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
++            status.append(" ").append(getString(R.string.ConditionalSendWaitingStatus));
++            timeString = status;
++        }
+         if (currentMessageObject.messageOwner.video_processing_pending) {
+             timeString = formatString(R.string.ScheduledTimeApprox, timeString);
+         }
+@@ -18561,6 +18569,9 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
+             }
+         }
+         timeTextWidth = timeWidth = (int) Math.ceil(Theme.chat_timePaint.measureText(currentTimeString, 0, currentTimeString == null ? 0 : currentTimeString.length()));
++        if (currentMessageObject.isSending() && org.telegram.messenger.ConditionalSend.shouldWait(currentMessageObject.messageOwner)) {
++            timeTextWidth = timeWidth += dp(6);
++        }
+         if (currentMessageObject.scheduled && currentMessageObject.messageOwner.date == 0x7FFFFFFE || currentMessageObject.notime) {
+             timeWidth -= dp(8);
+         }
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
+index 87afb3944..560e84e58 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
+@@ -1246,6 +1246,7 @@ public class ChatActivity extends BaseFragment implements
+     public final static int OPTION_ABOUT_REVENUE_SHARING_ADS = 33;
+     public final static int OPTION_REPORT_AD = 34;
+     public final static int OPTION_REMOVE_ADS = 35;
++    public final static int OPTION_SEND_DEFERRED_NOW = 118;
+     public final static int OPTION_SEND_NOW = 100;
+     public final static int OPTION_EDIT_SCHEDULE_TIME = 102;
+     public final static int OPTION_SPEED_PROMO = 103;
+@@ -34539,6 +34540,18 @@ public class ChatActivity extends BaseFragment implements
+                 }
+                 break;
+             }
++            case OPTION_SEND_DEFERRED_NOW: {
++                closeMenu(!preserveDim);
++                if (selectedObject != null && selectedObject.messageOwner.params != null) {
++                    selectedObject.messageOwner.params.remove(org.telegram.messenger.ConditionalSend.PARAM_WAIT_FOR_WIFI);
++                    ArrayList<TLRPC.Message> pending = new ArrayList<>();
++                    pending.add(selectedObject.messageOwner);
++                    getMessagesStorage().putMessages(pending, false, true, false, 0, 0, 0);
++                    getSendMessagesHelper().retrySendMessage(selectedObject, false, 0);
++                    updateVisibleRows();
++                }
++                break;
++            }
+             case OPTION_EDIT_SCHEDULE_TIME: {
+                 MessageObject message = selectedObject;
+                 MessageObject.GroupedMessages group = selectedObjectGroup;
+@@ -35873,10 +35886,33 @@ public class ChatActivity extends BaseFragment implements
+     }
+ 
+     public void sendMedia(MediaController.PhotoEntry photoEntry, VideoEditedInfo videoEditedInfo, boolean notify, int scheduleDate, int scheduleRepeatPeriod, boolean forceDocument, long stars) {
++        sendMedia(photoEntry, videoEditedInfo, notify, scheduleDate, scheduleRepeatPeriod, forceDocument, stars, false, false);
++    }
++
++    private void sendMedia(MediaController.PhotoEntry photoEntry, VideoEditedInfo videoEditedInfo, boolean notify, int scheduleDate, int scheduleRepeatPeriod, boolean forceDocument, long stars, boolean waitForWifi, boolean decisionMade) {
+         if (photoEntry == null) {
+             return;
+         }
+ 
++        if (!decisionMade && photoEntry.isVideo && editingMessageObject == null && scheduleDate == 0
++                && org.telegram.messenger.ConditionalSend.isAboveThreshold(photoEntry.path, null)) {
++            int mode = org.telegram.messenger.ConditionalSend.mode();
++            if (mode == org.telegram.messenger.ConditionalSend.WAIT_AUTOMATICALLY && !org.telegram.messenger.ConditionalSend.isWifiConnected()) {
++                sendMedia(photoEntry, videoEditedInfo, notify, scheduleDate, scheduleRepeatPeriod, forceDocument, stars, true, true);
++                return;
++            } else if (mode == org.telegram.messenger.ConditionalSend.ASK) {
++                AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), themeDelegate);
++                builder.setTitle(LocaleController.getString(R.string.ConditionalSendWifiTitle));
++                builder.setMessage(LocaleController.formatString(R.string.ConditionalSendWifiMessage, AndroidUtilities.formatFileSize(org.telegram.messenger.ConditionalSend.getSize(photoEntry.path, null))));
++                builder.setPositiveButton(LocaleController.getString(R.string.ConditionalSendWhenWifi), (dialog, which) ->
++                    sendMedia(photoEntry, videoEditedInfo, notify, scheduleDate, scheduleRepeatPeriod, forceDocument, stars, true, true));
++                builder.setNegativeButton(LocaleController.getString(R.string.ConditionalSendNow), (dialog, which) ->
++                    sendMedia(photoEntry, videoEditedInfo, notify, scheduleDate, scheduleRepeatPeriod, forceDocument, stars, false, true));
++                showDialog(builder.create());
++                return;
++            }
++        }
++
+         animatorRoundMessageCameraVisibility.setValue(false, true);
+ 
+         if (editingMessageObject != null && editingMessageObject.needResendWhenEdit() && !ChatObject.canManageMonoForum(currentAccount, editingMessageObject.getDialogId())) {
+@@ -35911,7 +35947,7 @@ public class ChatActivity extends BaseFragment implements
+                 }
+             } else {
+                 if (photoEntry.isVideo) {
+-                    SendMessagesHelper.prepareSendingVideo(getAccountInstance(), photoEntry.path, videoEditedInfo, photoEntry.coverPath, photoEntry.coverPhoto, dialog_id, replyingMessageObject, getThreadMessage(), null, replyingQuote, photoEntry.entities, photoEntry.ttl, editingMessageObject, notify, scheduleDate, scheduleRepeatPeriod, forceDocument, photoEntry.hasSpoiler, photoEntry.caption, getMessageChatSendParams(), photoEntry.effectId, payStars, getSendMonoForumPeerId(), getSendMessageSuggestionParams());
++                    SendMessagesHelper.prepareSendingVideo(getAccountInstance(), photoEntry.path, videoEditedInfo, photoEntry.coverPath, photoEntry.coverPhoto, dialog_id, replyingMessageObject, getThreadMessage(), null, replyingQuote, photoEntry.entities, photoEntry.ttl, editingMessageObject, notify, scheduleDate, scheduleRepeatPeriod, forceDocument, photoEntry.hasSpoiler, photoEntry.caption, getMessageChatSendParams(), photoEntry.effectId, payStars, getSendMonoForumPeerId(), getSendMessageSuggestionParams(), false, waitForWifi);
+                 } else {
+                     if (photoEntry.imagePath != null) {
+                         SendMessagesHelper.prepareSendingPhoto(getAccountInstance(), photoEntry.imagePath, photoEntry.thumbPath, null, dialog_id, replyingMessageObject, getThreadMessage(), null, replyingQuote, photoEntry.entities, photoEntry.stickers, null, photoEntry.ttl, editingMessageObject, videoEditedInfo, notify, scheduleDate, scheduleRepeatPeriod, 0, forceDocument, photoEntry.caption, getMessageChatSendParams(), photoEntry.effectId, payStars, getSendMonoForumPeerId(), getSendMessageSuggestionParams());
+@@ -41729,6 +41765,24 @@ public class ChatActivity extends BaseFragment implements
+         @Override
+         public void didPressImage(ChatMessageCell cell, float x, float y, boolean fullPreview) {
+             MessageObject message = cell.getMessageObject();
++            if (message.isSending() && org.telegram.messenger.ConditionalSend.shouldWait(message.messageOwner)) {
++                AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), themeDelegate);
++                builder.setTitle(LocaleController.getString(R.string.ConditionalSendWaitingStatus));
++                builder.setItems(new CharSequence[]{LocaleController.getString(R.string.ConditionalSendNow), LocaleController.getString(R.string.ConditionalSendCancel)}, (dialog, which) -> {
++                    if (which == 0) {
++                        message.messageOwner.params.remove(org.telegram.messenger.ConditionalSend.PARAM_WAIT_FOR_WIFI);
++                        ArrayList<TLRPC.Message> pending = new ArrayList<>();
++                        pending.add(message.messageOwner);
++                        getMessagesStorage().putMessages(pending, false, true, false, 0, 0, 0);
++                        getSendMessagesHelper().retrySendMessage(message, false, 0);
++                        updateVisibleRows();
++                    } else {
++                        getSendMessagesHelper().cancelSendingMessage(message);
++                    }
++                });
++                showDialog(builder.create());
++                return;
++            }
+             if (message.type == MessageObject.TYPE_STORY) {
+                 if (message.messageOwner.media.storyItem != null && !(message.messageOwner.media.storyItem instanceof TL_stories.TL_storyItemDeleted)) {
+                     TL_stories.StoryItem storyItem = message.messageOwner.media.storyItem;
+@@ -46197,6 +46251,11 @@ public class ChatActivity extends BaseFragment implements
+                 options.add(OPTION_COPY);
+                 icons.add(R.drawable.msg_copy);
+             }
++            if (selectedObject != null && selectedObject.isSending() && org.telegram.messenger.ConditionalSend.shouldWait(selectedObject.messageOwner)) {
++                items.add(LocaleController.getString(R.string.ConditionalSendNow));
++                options.add(OPTION_SEND_DEFERRED_NOW);
++                icons.add(R.drawable.msg_send);
++            }
+             items.add(LocaleController.getString(R.string.CancelSending));
+             options.add(OPTION_CANCEL_SENDING);
+             icons.add(R.drawable.msg_delete);
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/DataSettingsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/DataSettingsActivity.java
+index 910de86ec..0e30bcee6 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/DataSettingsActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/DataSettingsActivity.java
+@@ -28,6 +28,7 @@ import androidx.recyclerview.widget.RecyclerView;
+ 
+ import org.telegram.messenger.AndroidUtilities;
+ import org.telegram.messenger.BuildVars;
++import org.telegram.messenger.ConditionalSend;
+ import org.telegram.messenger.DownloadController;
+ import org.telegram.messenger.ImageLoader;
+ import org.telegram.messenger.LocaleController;
+@@ -56,6 +57,7 @@ import org.telegram.ui.Components.AlertsCreator;
+ import org.telegram.ui.Components.CubicBezierInterpolator;
+ import org.telegram.ui.Components.LayoutHelper;
+ import org.telegram.ui.Components.RecyclerListView;
++import org.telegram.ui.Components.SeekBarView;
+ import org.telegram.ui.Components.voip.VoIPHelper;
+ 
+ import java.io.File;
+@@ -71,6 +73,10 @@ public class DataSettingsActivity extends BaseFragment {
+     private ArrayList<File> storageDirs;
+ 
+     private int mediaDownloadSectionRow;
++    private int conditionalSendSectionRow;
++    private int conditionalSendModeRow;
++    private int conditionalSendThresholdRow;
++    private int conditionalSendSection2Row;
+     private int mobileRow;
+     private int roamingRow;
+     private int wifiRow;
+@@ -167,6 +173,10 @@ public class DataSettingsActivity extends BaseFragment {
+             }
+         }
+         mediaDownloadSection2Row = rowCount++;
++        conditionalSendSectionRow = rowCount++;
++        conditionalSendModeRow = rowCount++;
++        conditionalSendThresholdRow = rowCount++;
++        conditionalSendSection2Row = rowCount++;
+ 
+         saveToGallerySectionRow = rowCount++;
+         saveToGalleryPeerRow = rowCount++;
+@@ -299,7 +309,16 @@ public class DataSettingsActivity extends BaseFragment {
+         frameLayout.addView(listView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT, Gravity.TOP | Gravity.LEFT));
+         listView.setAdapter(listAdapter);
+         listView.setOnItemClickListener((view, position, x, y) -> {
+-            if (position == saveToGalleryGroupsRow || position == saveToGalleryChannelsRow || position == saveToGalleryPeerRow) {
++            if (position == conditionalSendModeRow) {
++                CharSequence[] choices = {LocaleController.getString(R.string.ConditionalSendModeImmediate), LocaleController.getString(R.string.ConditionalSendModeAsk), LocaleController.getString(R.string.ConditionalSendModeAutomatic)};
++                AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
++                builder.setTitle(LocaleController.getString(R.string.ConditionalSendSettingsMode));
++                builder.setItems(choices, (dialog, which) -> {
++                    ConditionalSend.setMode(which);
++                    rebind(conditionalSendModeRow);
++                });
++                showDialog(builder.create());
++            } else if (position == saveToGalleryGroupsRow || position == saveToGalleryChannelsRow || position == saveToGalleryPeerRow) {
+                 int flag;
+                 if (position == saveToGalleryGroupsRow) {
+                     flag = SharedConfig.SAVE_TO_GALLERY_FLAG_GROUP;
+@@ -623,6 +642,66 @@ public class DataSettingsActivity extends BaseFragment {
+         DownloadController.getInstance(currentAccount).checkAutodownloadSettings();
+     }
+ 
++    private class ConditionalSendSliderCell extends FrameLayout {
++        private final TextView titleView;
++        private final TextView valueView;
++        private final SeekBarView seekBarView;
++        private final int[] values = {20, 50, 100, 200, 500};
++
++        ConditionalSendSliderCell(Context context) {
++            super(context);
++            setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
++            setPadding(AndroidUtilities.dp(26), AndroidUtilities.dp(12), AndroidUtilities.dp(16), AndroidUtilities.dp(8));
++            titleView = new TextView(context);
++            titleView.setTextSize(16);
++            titleView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
++            addView(titleView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 28, Gravity.TOP | Gravity.LEFT, 0, 0, 110, 0));
++            valueView = new TextView(context);
++            valueView.setTextSize(16);
++            valueView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText));
++            valueView.setGravity(Gravity.RIGHT);
++            addView(valueView, LayoutHelper.createFrame(110, 28, Gravity.TOP | Gravity.RIGHT, 0, 0, 0, 0));
++            seekBarView = new SeekBarView(context, true, null);
++            seekBarView.setReportChanges(true);
++            seekBarView.setDelegate(new SeekBarView.SeekBarViewDelegate() {
++                @Override
++                public void onSeekBarDrag(boolean stop, float progress) {
++                    int index = Math.max(0, Math.min(values.length - 1, Math.round(progress * (values.length - 1))));
++                    ConditionalSend.setThresholdMb(values[index]);
++                    updateValue(index);
++                }
++
++                @Override
++                public void onSeekBarPressed(boolean pressed) { }
++
++                @Override
++                public CharSequence getContentDescription() {
++                    return valueView.getText();
++                }
++            });
++            addView(seekBarView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 38, Gravity.TOP | Gravity.LEFT, 0, 34, 0, 0));
++            update();
++        }
++
++        void update() {
++            int threshold = ConditionalSend.thresholdMb();
++            int index = 0;
++            for (int i = 0; i < values.length; i++) {
++                if (values[i] == threshold) {
++                    index = i;
++                    break;
++                }
++            }
++            titleView.setText(LocaleController.getString(R.string.ConditionalSendSettingsThreshold));
++            seekBarView.setProgress(index / (float) (values.length - 1));
++            updateValue(index);
++        }
++
++        private void updateValue(int index) {
++            valueView.setText(LocaleController.formatString(R.string.ConditionalSendThresholdValue, values[index]));
++        }
++    }
++
+     @Override
+     public void onResume() {
+         super.onResume();
+@@ -688,6 +767,10 @@ public class DataSettingsActivity extends BaseFragment {
+                     }
+                     break;
+                 }
++                case 7: {
++                    ((ConditionalSendSliderCell) holder.itemView).update();
++                    break;
++                }
+                 case 1: {
+                     TextSettingsCell textCell = (TextSettingsCell) holder.itemView;
+                     textCell.setCanDisable(false);
+@@ -712,6 +795,11 @@ public class DataSettingsActivity extends BaseFragment {
+                         }
+                         textCell.setTextAndValue(LocaleController.getString(R.string.VoipUseLessData), value, updateVoipUseLessData, true);
+                         updateVoipUseLessData = false;
++                    } else if (position == conditionalSendModeRow) {
++                        String[] modes = {LocaleController.getString(R.string.ConditionalSendModeImmediate), LocaleController.getString(R.string.ConditionalSendModeAsk), LocaleController.getString(R.string.ConditionalSendModeAutomatic)};
++                        textCell.setTextAndValue(LocaleController.getString(R.string.ConditionalSendSettingsMode), modes[ConditionalSend.mode()], true);
++                    } else if (position == conditionalSendThresholdRow) {
++                        textCell.setTextAndValue(LocaleController.getString(R.string.ConditionalSendSettingsThreshold), LocaleController.formatString(R.string.ConditionalSendThresholdValue, ConditionalSend.thresholdMb()), false);
+                     } else if (position == proxyRow) {
+                         textCell.setIcon(0);
+                         textCell.setText(LocaleController.getString(R.string.ProxySettings), false);
+@@ -733,6 +821,8 @@ public class DataSettingsActivity extends BaseFragment {
+                     HeaderCell headerCell = (HeaderCell) holder.itemView;
+                     if (position == mediaDownloadSectionRow) {
+                         headerCell.setText(LocaleController.getString(R.string.AutomaticMediaDownload));
++                    } else if (position == conditionalSendSectionRow) {
++                        headerCell.setText(LocaleController.getString(R.string.ConditionalSendSettingsHeader));
+                     } else if (position == usageSectionRow) {
+                         headerCell.setText(LocaleController.getString(R.string.DataUsage));
+                     } else if (position == callsSectionRow) {
+@@ -885,7 +975,7 @@ public class DataSettingsActivity extends BaseFragment {
+         public boolean isRowEnabled(int position) {
+             return position == mobileRow || position == roamingRow || position == wifiRow || position == storageUsageRow || position == useLessDataForCallsRow || position == dataUsageRow || position == proxyRow || position == clearDraftsRow ||
+                     position == enableCacheStreamRow || position == enableStreamRow || position == enableAllStreamRow || position == enableMkvRow || position == quickRepliesRow || position == autoplayVideoRow || position == autoplayGifsRow ||
+-                    position == storageNumRow || position == saveToGalleryGroupsRow || position == saveToGalleryPeerRow || position == saveToGalleryChannelsRow || position == resetDownloadRow;
++                    position == storageNumRow || position == saveToGalleryGroupsRow || position == saveToGalleryPeerRow || position == saveToGalleryChannelsRow || position == resetDownloadRow || position == conditionalSendModeRow || position == conditionalSendThresholdRow;
+         }
+ 
+         @Override
+@@ -916,6 +1006,11 @@ public class DataSettingsActivity extends BaseFragment {
+                     view = new NotificationsCheckCell(mContext);
+                     break;
+                 case 6:
++                    view = new TextCell(mContext);
++                    break;
++                case 7:
++                    view = new ConditionalSendSliderCell(mContext);
++                    break;
+                 default:
+                     view = new TextCell(mContext);
+                     break;
+@@ -926,9 +1021,9 @@ public class DataSettingsActivity extends BaseFragment {
+ 
+         @Override
+         public int getItemViewType(int position) {
+-            if (position == mediaDownloadSection2Row || position == usageSection2Row || position == callsSection2Row || position == proxySection2Row || position == autoplaySectionRow || position == clearDraftsSectionRow || position == saveToGalleryDividerRow) {
++            if (position == mediaDownloadSection2Row || position == usageSection2Row || position == callsSection2Row || position == proxySection2Row || position == autoplaySectionRow || position == clearDraftsSectionRow || position == saveToGalleryDividerRow || position == conditionalSendSection2Row) {
+                 return 0;
+-            } else if (position == mediaDownloadSectionRow || position == streamSectionRow || position == callsSectionRow || position == usageSectionRow || position == proxySectionRow || position == autoplayHeaderRow || position == saveToGallerySectionRow) {
++            } else if (position == mediaDownloadSectionRow || position == streamSectionRow || position == callsSectionRow || position == usageSectionRow || position == proxySectionRow || position == autoplayHeaderRow || position == saveToGallerySectionRow || position == conditionalSendSectionRow) {
+                 return 2;
+             } else if (position == enableCacheStreamRow || position == enableStreamRow || position == enableAllStreamRow || position == enableMkvRow || position == autoplayGifsRow || position == autoplayVideoRow) {
+                 return 3;
+@@ -936,6 +1031,8 @@ public class DataSettingsActivity extends BaseFragment {
+                 return 4;
+             } else if (position == mobileRow || position == wifiRow || position == roamingRow || position == saveToGalleryGroupsRow || position == saveToGalleryPeerRow || position == saveToGalleryChannelsRow) {
+                 return 5;
++            } else if (position == conditionalSendThresholdRow) {
++                return 7;
+             } else if (position == storageUsageRow || position == dataUsageRow || position == storageNumRow) {
+                 return 6;
+             } else {
+diff --git a/TMessagesProj/src/main/res/values-ru/strings.xml b/TMessagesProj/src/main/res/values-ru/strings.xml
+index 24c562920..bde7ed1e6 100644
+--- a/TMessagesProj/src/main/res/values-ru/strings.xml
++++ b/TMessagesProj/src/main/res/values-ru/strings.xml
+@@ -263,4 +263,22 @@
+     <string name="RemindTodayAt">\'Отправить сегодня в\' HH:mm</string>
+     <string name="RemindDayAt">\'Отправить\' d MMM \'в\' HH:mm</string>
+     <string name="RemindDayYearAt">\'Напомнить\' d MMM yyyy \'в\' HH:mm</string>
+-</resources>
+\ No newline at end of file
++    <string name="ConditionalSendWifiTitle">Отправить через Wi-Fi?</string>
++    <string name="ConditionalSendWifiMessage">Видео %1$s. Сэкономьте мобильный трафик.</string>
++    <string name="ConditionalSendWhenWifi">Ждать Wi-Fi</string>
++    <string name="ConditionalSendNow">Отправить сейчас</string>
++    <string name="ConditionalSendCancel">Отменить отправку</string>
++    <string name="ConditionalSendWaitingStatus">Отложено до Wi-Fi</string>
++    <string name="ConditionalSendSettingsHeader">Отправка через Wi-Fi</string>
++    <string name="ConditionalSendSettingsMode">Отправка больших видео</string>
++    <string name="ConditionalSendSettingsThreshold">От размера видео</string>
++    <string name="ConditionalSendModeImmediate">Всегда отправлять сразу</string>
++    <string name="ConditionalSendModeAsk">Спрашивать перед отправкой</string>
++    <string name="ConditionalSendModeAutomatic">Автоматически ждать Wi-Fi</string>
++    <string name="ConditionalSendThreshold20">20 МБ</string>
++    <string name="ConditionalSendThreshold50">50 МБ</string>
++    <string name="ConditionalSendThreshold100">100 МБ</string>
++    <string name="ConditionalSendThreshold200">200 МБ</string>
++    <string name="ConditionalSendThreshold500">500 МБ</string>
++    <string name="ConditionalSendThresholdValue">от %1$d МБ</string>
++</resources>
+diff --git a/TMessagesProj/src/main/res/values/strings.xml b/TMessagesProj/src/main/res/values/strings.xml
+index db9de7556..11a6b5546 100644
+--- a/TMessagesProj/src/main/res/values/strings.xml
++++ b/TMessagesProj/src/main/res/values/strings.xml
+@@ -11630,4 +11630,22 @@
+     <string name="NoPaidMessagesTokenUsed">un1 used your QR code and can message you for free</string>
+     <string name="NoPaidMessagesTokenUsedOut">You used the QR code of un1 and can message them for free</string>
+     <string name="NoPaidMessagesTokenImported">You can now message **%1$s** for free.</string>
++    <string name="ConditionalSendWifiTitle">Send over Wi-Fi?</string>
++    <string name="ConditionalSendWifiMessage">Video: %1$s. Save mobile data.</string>
++    <string name="ConditionalSendWhenWifi">Wait for Wi-Fi</string>
++    <string name="ConditionalSendNow">Send now</string>
++    <string name="ConditionalSendCancel">Cancel sending</string>
++    <string name="ConditionalSendWaitingStatus">Deferred until Wi-Fi</string>
++    <string name="ConditionalSendSettingsHeader">Send over Wi-Fi</string>
++    <string name="ConditionalSendSettingsMode">Large video sending</string>
++    <string name="ConditionalSendSettingsThreshold">From video size</string>
++    <string name="ConditionalSendModeImmediate">Always send immediately</string>
++    <string name="ConditionalSendModeAsk">Ask before sending</string>
++    <string name="ConditionalSendModeAutomatic">Automatically wait for Wi-Fi</string>
++    <string name="ConditionalSendThreshold20">20 MB</string>
++    <string name="ConditionalSendThreshold50">50 MB</string>
++    <string name="ConditionalSendThreshold100">100 MB</string>
++    <string name="ConditionalSendThreshold200">200 MB</string>
++    <string name="ConditionalSendThreshold500">500 MB</string>
++    <string name="ConditionalSendThresholdValue">from %1$d MB</string>
+ </resources>
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/ConditionalSend.java b/TMessagesProj/src/main/java/org/telegram/messenger/ConditionalSend.java
+new file mode 100644
+index 000000000..cc71a05e0
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/ConditionalSend.java
+@@ -0,0 +1,147 @@
++package org.telegram.messenger;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++import android.net.ConnectivityManager;
++import android.net.NetworkInfo;
++import android.net.Uri;
++import android.content.res.AssetFileDescriptor;
++
++import androidx.annotation.NonNull;
++import androidx.work.Constraints;
++import androidx.work.ExistingWorkPolicy;
++import androidx.work.NetworkType;
++import androidx.work.OneTimeWorkRequest;
++import androidx.work.Worker;
++import androidx.work.WorkerParameters;
++import androidx.work.WorkManager;
++
++/** Persists the Wi-Fi requirement on the outgoing message itself. */
++public final class ConditionalSend {
++    public static final String PARAM_WAIT_FOR_WIFI = "conditional_send_wifi";
++    public static final int SEND_NOW = 0;
++    public static final int ASK = 1;
++    public static final int WAIT_AUTOMATICALLY = 2;
++    private static volatile boolean resumingOnWifi;
++
++    private ConditionalSend() { }
++
++    private static SharedPreferences preferences() {
++        return MessagesController.getGlobalMainSettings();
++    }
++
++    public static int mode() {
++        return preferences().getInt("conditional_send_mode", ASK);
++    }
++
++    public static void setMode(int mode) {
++        preferences().edit().putInt("conditional_send_mode", mode).apply();
++    }
++
++    public static int thresholdMb() {
++        return preferences().getInt("conditional_send_threshold_mb", 20);
++    }
++
++    public static void setThresholdMb(int thresholdMb) {
++        preferences().edit().putInt("conditional_send_threshold_mb", thresholdMb).apply();
++    }
++
++    public static boolean shouldOffer(String path) {
++        return shouldOffer(path, null);
++    }
++
++    public static boolean isAboveThreshold(String path, Uri uri) {
++        return getSize(path, uri) > thresholdMb() * 1024L * 1024L;
++    }
++
++    public static boolean shouldOffer(String path, Uri uri) {
++        return isAboveThreshold(path, uri)
++                && !isWifiConnected();
++    }
++
++    public static long getSize(String path, Uri uri) {
++        if (path != null) {
++            if (uri == null && path.startsWith("content://")) {
++                uri = Uri.parse(path);
++            }
++            long size = new java.io.File(path).length();
++            if (size > 0) {
++                return size;
++            }
++        }
++        if (uri != null) {
++            try (AssetFileDescriptor descriptor = ApplicationLoader.applicationContext.getContentResolver().openAssetFileDescriptor(uri, "r")) {
++                if (descriptor != null && descriptor.getLength() > 0) {
++                    return descriptor.getLength();
++                }
++            } catch (Throwable ignore) {
++            }
++        }
++        return 0;
++    }
++
++    public static boolean isVideo(String path, Uri uri) {
++        if (path != null) {
++            String lower = path.toLowerCase(java.util.Locale.US);
++            if (lower.endsWith(".mp4") || lower.endsWith(".mov") || lower.endsWith(".mkv") || lower.endsWith(".webm") || lower.endsWith(".avi") || lower.endsWith(".3gp")) {
++                return true;
++            }
++        }
++        if (uri != null) {
++            try {
++                String mime = ApplicationLoader.applicationContext.getContentResolver().getType(uri);
++                return mime != null && mime.startsWith("video/");
++            } catch (Throwable ignore) {
++            }
++        }
++        return false;
++    }
++
++    public static boolean shouldWait(org.telegram.tgnet.TLRPC.Message message) {
++        return message.params != null && "1".equals(message.params.get(PARAM_WAIT_FOR_WIFI))
++                && !resumingOnWifi;
++    }
++
++    public static void schedule(int account) {
++        Constraints constraints = new Constraints.Builder().setRequiredNetworkType(NetworkType.UNMETERED).build();
++        OneTimeWorkRequest request = new OneTimeWorkRequest.Builder(ResumeWorker.class)
++                .setConstraints(constraints)
++                .setInputData(new androidx.work.Data.Builder().putInt("account", account).build())
++                .build();
++        WorkManager.getInstance(ApplicationLoader.applicationContext)
++                .enqueueUniqueWork("conditional_send_" + account, ExistingWorkPolicy.KEEP, request);
++    }
++
++    public static boolean isWifiConnected() {
++        try {
++            ConnectivityManager manager = (ConnectivityManager) ApplicationLoader.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE);
++            NetworkInfo info = manager != null ? manager.getActiveNetworkInfo() : null;
++            return info != null && info.isConnected() && (info.getType() == ConnectivityManager.TYPE_WIFI || info.getType() == ConnectivityManager.TYPE_ETHERNET);
++        } catch (Throwable ignore) {
++            return false;
++        }
++    }
++
++    public static class ResumeWorker extends Worker {
++        public ResumeWorker(@NonNull Context context, @NonNull WorkerParameters parameters) {
++            super(context, parameters);
++        }
++
++        @NonNull
++        @Override
++        public Result doWork() {
++            ApplicationLoader.postInitApplication();
++            if (!isWifiConnected()) {
++                return Result.retry();
++            }
++            int account = getInputData().getInt("account", -1);
++            if (account < 0 || account >= UserConfig.MAX_ACCOUNT_COUNT) {
++                return Result.failure();
++            }
++            resumingOnWifi = true;
++            SendMessagesHelper.getInstance(account).checkUnsentMessages();
++            AndroidUtilities.runOnUIThread(() -> resumingOnWifi = false, 60_000);
++            return Result.success();
++        }
++    }
++}
