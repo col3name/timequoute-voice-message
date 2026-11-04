@@ -1,15 +1,156 @@
-diff --git a/TMessagesProj/build.gradle b/TMessagesProj/build.gradle
-index f9a3639a1..1bcc6f43e 100644
---- a/TMessagesProj/build.gradle
-+++ b/TMessagesProj/build.gradle
-@@ -50,6 +50,7 @@ dependencies {
-     implementation 'androidx.interpolator:interpolator:1.0.0'
-     implementation 'androidx.biometric:biometric:1.1.0'
-     implementation 'androidx.webkit:webkit:1.14.0'
-+    implementation 'androidx.work:work-runtime:2.10.4'
- 
-     implementation 'com.google.android.gms:play-services-cast-framework:21.4.0'
-     implementation "androidx.mediarouter:mediarouter:1.7.0"
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/ConditionalSend.java b/TMessagesProj/src/main/java/org/telegram/messenger/ConditionalSend.java
+new file mode 100644
+index 000000000..cc71a05e0
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/ConditionalSend.java
+@@ -0,0 +1,147 @@
++package org.telegram.messenger;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++import android.net.ConnectivityManager;
++import android.net.NetworkInfo;
++import android.net.Uri;
++import android.content.res.AssetFileDescriptor;
++
++import androidx.annotation.NonNull;
++import androidx.work.Constraints;
++import androidx.work.ExistingWorkPolicy;
++import androidx.work.NetworkType;
++import androidx.work.OneTimeWorkRequest;
++import androidx.work.Worker;
++import androidx.work.WorkerParameters;
++import androidx.work.WorkManager;
++
++/** Persists the Wi-Fi requirement on the outgoing message itself. */
++public final class ConditionalSend {
++    public static final String PARAM_WAIT_FOR_WIFI = "conditional_send_wifi";
++    public static final int SEND_NOW = 0;
++    public static final int ASK = 1;
++    public static final int WAIT_AUTOMATICALLY = 2;
++    private static volatile boolean resumingOnWifi;
++
++    private ConditionalSend() { }
++
++    private static SharedPreferences preferences() {
++        return MessagesController.getGlobalMainSettings();
++    }
++
++    public static int mode() {
++        return preferences().getInt("conditional_send_mode", ASK);
++    }
++
++    public static void setMode(int mode) {
++        preferences().edit().putInt("conditional_send_mode", mode).apply();
++    }
++
++    public static int thresholdMb() {
++        return preferences().getInt("conditional_send_threshold_mb", 20);
++    }
++
++    public static void setThresholdMb(int thresholdMb) {
++        preferences().edit().putInt("conditional_send_threshold_mb", thresholdMb).apply();
++    }
++
++    public static boolean shouldOffer(String path) {
++        return shouldOffer(path, null);
++    }
++
++    public static boolean isAboveThreshold(String path, Uri uri) {
++        return getSize(path, uri) > thresholdMb() * 1024L * 1024L;
++    }
++
++    public static boolean shouldOffer(String path, Uri uri) {
++        return isAboveThreshold(path, uri)
++                && !isWifiConnected();
++    }
++
++    public static long getSize(String path, Uri uri) {
++        if (path != null) {
++            if (uri == null && path.startsWith("content://")) {
++                uri = Uri.parse(path);
++            }
++            long size = new java.io.File(path).length();
++            if (size > 0) {
++                return size;
++            }
++        }
++        if (uri != null) {
++            try (AssetFileDescriptor descriptor = ApplicationLoader.applicationContext.getContentResolver().openAssetFileDescriptor(uri, "r")) {
++                if (descriptor != null && descriptor.getLength() > 0) {
++                    return descriptor.getLength();
++                }
++            } catch (Throwable ignore) {
++            }
++        }
++        return 0;
++    }
++
++    public static boolean isVideo(String path, Uri uri) {
++        if (path != null) {
++            String lower = path.toLowerCase(java.util.Locale.US);
++            if (lower.endsWith(".mp4") || lower.endsWith(".mov") || lower.endsWith(".mkv") || lower.endsWith(".webm") || lower.endsWith(".avi") || lower.endsWith(".3gp")) {
++                return true;
++            }
++        }
++        if (uri != null) {
++            try {
++                String mime = ApplicationLoader.applicationContext.getContentResolver().getType(uri);
++                return mime != null && mime.startsWith("video/");
++            } catch (Throwable ignore) {
++            }
++        }
++        return false;
++    }
++
++    public static boolean shouldWait(org.telegram.tgnet.TLRPC.Message message) {
++        return message.params != null && "1".equals(message.params.get(PARAM_WAIT_FOR_WIFI))
++                && !resumingOnWifi;
++    }
++
++    public static void schedule(int account) {
++        Constraints constraints = new Constraints.Builder().setRequiredNetworkType(NetworkType.UNMETERED).build();
++        OneTimeWorkRequest request = new OneTimeWorkRequest.Builder(ResumeWorker.class)
++                .setConstraints(constraints)
++                .setInputData(new androidx.work.Data.Builder().putInt("account", account).build())
++                .build();
++        WorkManager.getInstance(ApplicationLoader.applicationContext)
++                .enqueueUniqueWork("conditional_send_" + account, ExistingWorkPolicy.KEEP, request);
++    }
++
++    public static boolean isWifiConnected() {
++        try {
++            ConnectivityManager manager = (ConnectivityManager) ApplicationLoader.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE);
++            NetworkInfo info = manager != null ? manager.getActiveNetworkInfo() : null;
++            return info != null && info.isConnected() && (info.getType() == ConnectivityManager.TYPE_WIFI || info.getType() == ConnectivityManager.TYPE_ETHERNET);
++        } catch (Throwable ignore) {
++            return false;
++        }
++    }
++
++    public static class ResumeWorker extends Worker {
++        public ResumeWorker(@NonNull Context context, @NonNull WorkerParameters parameters) {
++            super(context, parameters);
++        }
++
++        @NonNull
++        @Override
++        public Result doWork() {
++            ApplicationLoader.postInitApplication();
++            if (!isWifiConnected()) {
++                return Result.retry();
++            }
++            int account = getInputData().getInt("account", -1);
++            if (account < 0 || account >= UserConfig.MAX_ACCOUNT_COUNT) {
++                return Result.failure();
++            }
++            resumingOnWifi = true;
++            SendMessagesHelper.getInstance(account).checkUnsentMessages();
++            AndroidUtilities.runOnUIThread(() -> resumingOnWifi = false, 60_000);
++            return Result.success();
++        }
++    }
++}
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java b/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java
 index 071e9778b..31b2e91d2 100644
 --- a/TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java
@@ -562,156 +703,3 @@ index db9de7556..11a6b5546 100644
 +    <string name="ConditionalSendThreshold500">500 MB</string>
 +    <string name="ConditionalSendThresholdValue">from %1$d MB</string>
  </resources>
-diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/ConditionalSend.java b/TMessagesProj/src/main/java/org/telegram/messenger/ConditionalSend.java
-new file mode 100644
-index 000000000..cc71a05e0
---- /dev/null
-+++ b/TMessagesProj/src/main/java/org/telegram/messenger/ConditionalSend.java
-@@ -0,0 +1,147 @@
-+package org.telegram.messenger;
-+
-+import android.content.Context;
-+import android.content.SharedPreferences;
-+import android.net.ConnectivityManager;
-+import android.net.NetworkInfo;
-+import android.net.Uri;
-+import android.content.res.AssetFileDescriptor;
-+
-+import androidx.annotation.NonNull;
-+import androidx.work.Constraints;
-+import androidx.work.ExistingWorkPolicy;
-+import androidx.work.NetworkType;
-+import androidx.work.OneTimeWorkRequest;
-+import androidx.work.Worker;
-+import androidx.work.WorkerParameters;
-+import androidx.work.WorkManager;
-+
-+/** Persists the Wi-Fi requirement on the outgoing message itself. */
-+public final class ConditionalSend {
-+    public static final String PARAM_WAIT_FOR_WIFI = "conditional_send_wifi";
-+    public static final int SEND_NOW = 0;
-+    public static final int ASK = 1;
-+    public static final int WAIT_AUTOMATICALLY = 2;
-+    private static volatile boolean resumingOnWifi;
-+
-+    private ConditionalSend() { }
-+
-+    private static SharedPreferences preferences() {
-+        return MessagesController.getGlobalMainSettings();
-+    }
-+
-+    public static int mode() {
-+        return preferences().getInt("conditional_send_mode", ASK);
-+    }
-+
-+    public static void setMode(int mode) {
-+        preferences().edit().putInt("conditional_send_mode", mode).apply();
-+    }
-+
-+    public static int thresholdMb() {
-+        return preferences().getInt("conditional_send_threshold_mb", 20);
-+    }
-+
-+    public static void setThresholdMb(int thresholdMb) {
-+        preferences().edit().putInt("conditional_send_threshold_mb", thresholdMb).apply();
-+    }
-+
-+    public static boolean shouldOffer(String path) {
-+        return shouldOffer(path, null);
-+    }
-+
-+    public static boolean isAboveThreshold(String path, Uri uri) {
-+        return getSize(path, uri) > thresholdMb() * 1024L * 1024L;
-+    }
-+
-+    public static boolean shouldOffer(String path, Uri uri) {
-+        return isAboveThreshold(path, uri)
-+                && !isWifiConnected();
-+    }
-+
-+    public static long getSize(String path, Uri uri) {
-+        if (path != null) {
-+            if (uri == null && path.startsWith("content://")) {
-+                uri = Uri.parse(path);
-+            }
-+            long size = new java.io.File(path).length();
-+            if (size > 0) {
-+                return size;
-+            }
-+        }
-+        if (uri != null) {
-+            try (AssetFileDescriptor descriptor = ApplicationLoader.applicationContext.getContentResolver().openAssetFileDescriptor(uri, "r")) {
-+                if (descriptor != null && descriptor.getLength() > 0) {
-+                    return descriptor.getLength();
-+                }
-+            } catch (Throwable ignore) {
-+            }
-+        }
-+        return 0;
-+    }
-+
-+    public static boolean isVideo(String path, Uri uri) {
-+        if (path != null) {
-+            String lower = path.toLowerCase(java.util.Locale.US);
-+            if (lower.endsWith(".mp4") || lower.endsWith(".mov") || lower.endsWith(".mkv") || lower.endsWith(".webm") || lower.endsWith(".avi") || lower.endsWith(".3gp")) {
-+                return true;
-+            }
-+        }
-+        if (uri != null) {
-+            try {
-+                String mime = ApplicationLoader.applicationContext.getContentResolver().getType(uri);
-+                return mime != null && mime.startsWith("video/");
-+            } catch (Throwable ignore) {
-+            }
-+        }
-+        return false;
-+    }
-+
-+    public static boolean shouldWait(org.telegram.tgnet.TLRPC.Message message) {
-+        return message.params != null && "1".equals(message.params.get(PARAM_WAIT_FOR_WIFI))
-+                && !resumingOnWifi;
-+    }
-+
-+    public static void schedule(int account) {
-+        Constraints constraints = new Constraints.Builder().setRequiredNetworkType(NetworkType.UNMETERED).build();
-+        OneTimeWorkRequest request = new OneTimeWorkRequest.Builder(ResumeWorker.class)
-+                .setConstraints(constraints)
-+                .setInputData(new androidx.work.Data.Builder().putInt("account", account).build())
-+                .build();
-+        WorkManager.getInstance(ApplicationLoader.applicationContext)
-+                .enqueueUniqueWork("conditional_send_" + account, ExistingWorkPolicy.KEEP, request);
-+    }
-+
-+    public static boolean isWifiConnected() {
-+        try {
-+            ConnectivityManager manager = (ConnectivityManager) ApplicationLoader.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE);
-+            NetworkInfo info = manager != null ? manager.getActiveNetworkInfo() : null;
-+            return info != null && info.isConnected() && (info.getType() == ConnectivityManager.TYPE_WIFI || info.getType() == ConnectivityManager.TYPE_ETHERNET);
-+        } catch (Throwable ignore) {
-+            return false;
-+        }
-+    }
-+
-+    public static class ResumeWorker extends Worker {
-+        public ResumeWorker(@NonNull Context context, @NonNull WorkerParameters parameters) {
-+            super(context, parameters);
-+        }
-+
-+        @NonNull
-+        @Override
-+        public Result doWork() {
-+            ApplicationLoader.postInitApplication();
-+            if (!isWifiConnected()) {
-+                return Result.retry();
-+            }
-+            int account = getInputData().getInt("account", -1);
-+            if (account < 0 || account >= UserConfig.MAX_ACCOUNT_COUNT) {
-+                return Result.failure();
-+            }
-+            resumingOnWifi = true;
-+            SendMessagesHelper.getInstance(account).checkUnsentMessages();
-+            AndroidUtilities.runOnUIThread(() -> resumingOnWifi = false, 60_000);
-+            return Result.success();
-+        }
-+    }
-+}
