@@ -1,0 +1,1623 @@
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/PrivateChatLock.java b/TMessagesProj/src/main/java/org/telegram/messenger/PrivateChatLock.java
+new file mode 100644
+index 000000000..bad347125
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/PrivateChatLock.java
+@@ -0,0 +1,120 @@
++package org.telegram.messenger;
++
++import android.content.SharedPreferences;
++import android.util.Base64;
++
++import java.security.MessageDigest;
++import java.security.SecureRandom;
++import java.util.HashSet;
++import java.util.Set;
++
++import javax.crypto.SecretKeyFactory;
++import javax.crypto.spec.PBEKeySpec;
++
++/** Local, per-account UI state for hidden chats. This does not encrypt Telegram data. */
++public final class PrivateChatLock {
++    private static final SecureRandom RANDOM = new SecureRandom();
++    private static final long MAX_RETRY_DELAY_MS = 30_000L;
++
++    private PrivateChatLock() { }
++
++    private static SharedPreferences preferences(int account) {
++        return ApplicationLoader.applicationContext.getSharedPreferences("private_chats_" + account, 0);
++    }
++
++    public static boolean hasCode(int account) {
++        return preferences(account).contains("code_hash");
++    }
++
++    public static boolean checkCode(int account, String code) {
++        SharedPreferences prefs = preferences(account);
++        String saved = prefs.getString("code_hash", null);
++        String salt = prefs.getString("code_salt", null);
++        if (saved == null || salt == null || code == null) {
++            return false;
++        }
++        try {
++            byte[] expected = Base64.decode(saved, Base64.NO_WRAP);
++            byte[] actual = derive(code, Base64.decode(salt, Base64.NO_WRAP));
++            return MessageDigest.isEqual(expected, actual);
++        } catch (Exception e) {
++            return false;
++        }
++    }
++
++    public static long getUnlockRetryDelay(int account) {
++        long until = preferences(account).getLong("unlock_retry_until", 0L);
++        return Math.max(0L, until - System.currentTimeMillis());
++    }
++
++    public static void registerUnlockFailure(int account) {
++        SharedPreferences prefs = preferences(account);
++        int failures = prefs.getInt("unlock_failures", 0) + 1;
++        long delay = Math.min(MAX_RETRY_DELAY_MS, 1000L << Math.min(5, failures - 1));
++        prefs.edit().putInt("unlock_failures", failures)
++                .putLong("unlock_retry_until", System.currentTimeMillis() + delay).apply();
++    }
++
++    public static void resetUnlockFailures(int account) {
++        preferences(account).edit().remove("unlock_failures").remove("unlock_retry_until").apply();
++    }
++
++    public static boolean setCode(int account, String code) {
++        if (code == null || code.length() < 4) {
++            return false;
++        }
++        try {
++            byte[] salt = new byte[16];
++            RANDOM.nextBytes(salt);
++            preferences(account).edit()
++                    .putString("code_salt", Base64.encodeToString(salt, Base64.NO_WRAP))
++                    .putString("code_hash", Base64.encodeToString(derive(code, salt), Base64.NO_WRAP))
++                    .apply();
++            return true;
++        } catch (Exception e) {
++            return false;
++        }
++    }
++
++    private static byte[] derive(String code, byte[] salt) throws Exception {
++        PBEKeySpec spec = new PBEKeySpec(code.toCharArray(), salt, 210000, 256);
++        try {
++            return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded();
++        } finally {
++            spec.clearPassword();
++        }
++    }
++
++    public static boolean isLocked(int account, long dialogId) {
++        return preferences(account).getStringSet("dialog_ids", java.util.Collections.emptySet()).contains(Long.toString(dialogId));
++    }
++
++    public static void setLocked(int account, long dialogId, boolean locked) {
++        SharedPreferences prefs = preferences(account);
++        Set<String> ids = new HashSet<>(prefs.getStringSet("dialog_ids", java.util.Collections.emptySet()));
++        if (locked) {
++            ids.add(Long.toString(dialogId));
++        } else {
++            ids.remove(Long.toString(dialogId));
++        }
++        prefs.edit().putStringSet("dialog_ids", ids).apply();
++    }
++
++    public static Set<Long> getLockedIds(int account) {
++        Set<Long> result = new HashSet<>();
++        for (String id : preferences(account).getStringSet("dialog_ids", java.util.Collections.emptySet())) {
++            try {
++                result.add(Long.parseLong(id));
++            } catch (NumberFormatException ignored) { }
++        }
++        return result;
++    }
++
++    public static boolean isHideLocked(int account) {
++        return preferences(account).getBoolean("hide_locked", true);
++    }
++
++    public static void setHideLocked(int account, boolean hide) {
++        preferences(account).edit().putBoolean("hide_locked", hide).apply();
++    }
++}
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ActionIntroActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ActionIntroActivity.java
+index 7c3e4eb5b..43a1978a1 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/ActionIntroActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/ActionIntroActivity.java
+@@ -90,13 +90,15 @@ public class ActionIntroActivity extends BaseFragment implements LocationControl
+     public static final int ACTION_TYPE_CHANGE_PHONE_NUMBER = 3;
+     public static final int ACTION_TYPE_QR_LOGIN = 5;
+     public static final int ACTION_TYPE_SET_PASSCODE = 6;
++    public static final int ACTION_TYPE_SET_PRIVATE_CODE = 7;
+ 
+     @Retention(RetentionPolicy.SOURCE)
+     @IntDef({
+             ACTION_TYPE_CHANNEL_CREATE,
+             ACTION_TYPE_CHANGE_PHONE_NUMBER,
+             ACTION_TYPE_QR_LOGIN,
+-            ACTION_TYPE_SET_PASSCODE
++            ACTION_TYPE_SET_PASSCODE,
++            ACTION_TYPE_SET_PRIVATE_CODE
+     })
+     public @interface ActionType {}
+ 
+@@ -181,8 +183,9 @@ public class ActionIntroActivity extends BaseFragment implements LocationControl
+                         }
+                         break;
+                     }
+-                    case ACTION_TYPE_SET_PASSCODE: {
+-                        if (currentType == ACTION_TYPE_SET_PASSCODE) {
++                    case ACTION_TYPE_SET_PASSCODE:
++                    case ACTION_TYPE_SET_PRIVATE_CODE: {
++                        if (currentType == ACTION_TYPE_SET_PASSCODE || currentType == ACTION_TYPE_SET_PRIVATE_CODE) {
+                             imageView.measure(MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(140), MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(140), MeasureSpec.EXACTLY));
+                         } else {
+                             imageView.measure(MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(100), MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(100), MeasureSpec.EXACTLY));
+@@ -194,7 +197,7 @@ public class ActionIntroActivity extends BaseFragment implements LocationControl
+                         } else {
+                             titleTextView.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(height, MeasureSpec.UNSPECIFIED));
+                             descriptionText.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(height, MeasureSpec.UNSPECIFIED));
+-                            if (currentType == ACTION_TYPE_SET_PASSCODE) {
++                            if (currentType == ACTION_TYPE_SET_PASSCODE || currentType == ACTION_TYPE_SET_PRIVATE_CODE) {
+                                 buttonTextView.measure(MeasureSpec.makeMeasureSpec(width - AndroidUtilities.dp(24 * 2), MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(48), MeasureSpec.EXACTLY));
+                             } else {
+                                 buttonTextView.measure(MeasureSpec.makeMeasureSpec(width - AndroidUtilities.dp(72), MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(48), MeasureSpec.EXACTLY));
+@@ -309,7 +312,8 @@ public class ActionIntroActivity extends BaseFragment implements LocationControl
+                         }
+                         break;
+                     }
+-                    case ACTION_TYPE_SET_PASSCODE: {
++                    case ACTION_TYPE_SET_PASSCODE:
++                    case ACTION_TYPE_SET_PRIVATE_CODE: {
+                         if (r > b) {
+                             int y = (height - imageView.getMeasuredHeight()) / 2;
+                             int x = (int) (width * 0.5f - imageView.getMeasuredWidth()) / 2;
+@@ -409,7 +413,7 @@ public class ActionIntroActivity extends BaseFragment implements LocationControl
+         descriptionText.setGravity(Gravity.CENTER_HORIZONTAL);
+         descriptionText.setLineSpacing(AndroidUtilities.dp(2), 1);
+         descriptionText.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);
+-        if (currentType == ACTION_TYPE_SET_PASSCODE || currentType == ACTION_TYPE_CHANGE_PHONE_NUMBER) {
++        if (currentType == ACTION_TYPE_SET_PASSCODE || currentType == ACTION_TYPE_SET_PRIVATE_CODE || currentType == ACTION_TYPE_CHANGE_PHONE_NUMBER) {
+             descriptionText.setPadding(AndroidUtilities.dp(48), 0, AndroidUtilities.dp(48), 0);
+         } else {
+             descriptionText.setPadding(AndroidUtilities.dp(32), 0, AndroidUtilities.dp(32), 0);
+@@ -550,6 +554,10 @@ public class ActionIntroActivity extends BaseFragment implements LocationControl
+                     }
+                     break;
+                 }
++                case ACTION_TYPE_SET_PRIVATE_CODE: {
++                    presentFragment(new PasscodeActivity(PasscodeActivity.TYPE_SETUP_PRIVATE_CODE), true);
++                    break;
++                }
+                 case ACTION_TYPE_CHANGE_PHONE_NUMBER: {
+                     AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity());
+                     builder.setTitle(LocaleController.getString(R.string.PhoneNumberChangeTitle));
+@@ -573,7 +581,8 @@ public class ActionIntroActivity extends BaseFragment implements LocationControl
+                 flickerButton = true;
+                 break;
+             }
+-            case ACTION_TYPE_SET_PASSCODE: {
++            case ACTION_TYPE_SET_PASSCODE:
++            case ACTION_TYPE_SET_PRIVATE_CODE: {
+                 imageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                 imageView.setAnimation(R.raw.utyan_passcode, 200, 200);
+                 imageView.setFocusable(false);
+@@ -583,9 +592,9 @@ public class ActionIntroActivity extends BaseFragment implements LocationControl
+                         imageView.playAnimation();
+                     }
+                 });
+-                titleTextView.setText(LocaleController.getString(R.string.Passcode));
+-                descriptionText.setText(LocaleController.getString(R.string.ChangePasscodeInfoShort));
+-                buttonTextView.setText(LocaleController.getString(R.string.EnablePasscode));
++                titleTextView.setText(currentType == ACTION_TYPE_SET_PRIVATE_CODE ? "Secret code" : LocaleController.getString(R.string.Passcode));
++                descriptionText.setText(currentType == ACTION_TYPE_SET_PRIVATE_CODE ? "Protect your locked chats with a secret code. Enter it to open a locked chat." : LocaleController.getString(R.string.ChangePasscodeInfoShort));
++                buttonTextView.setText(currentType == ACTION_TYPE_SET_PRIVATE_CODE ? "Set Secret Code" : LocaleController.getString(R.string.EnablePasscode));
+                 imageView.playAnimation();
+                 flickerButton = true;
+                 break;
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Adapters/DialogsAdapter.java b/TMessagesProj/src/main/java/org/telegram/ui/Adapters/DialogsAdapter.java
+index cd393c4dd..9458b3a96 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/Adapters/DialogsAdapter.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Adapters/DialogsAdapter.java
+@@ -1223,7 +1223,16 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
+             fromDialog.pinnedNum = toDialog.pinnedNum;
+             toDialog.pinnedNum = oldNum;
+         }
+-        Collections.swap(dialogs, fromIndex, toIndex);
++        ArrayList<TLRPC.Dialog> sourceDialogs = dialogs;
++        if (dialogsType == DialogsActivity.DIALOGS_TYPE_DEFAULT) {
++            sourceDialogs = MessagesController.getInstance(currentAccount).getDialogs(folderId);
++        } else if (dialogsType == 7 || dialogsType == 8) {
++            MessagesController.DialogFilter filter = MessagesController.getInstance(currentAccount).selectedDialogFilter[dialogsType == 8 ? 1 : 0];
++            if (filter != null) {
++                sourceDialogs = filter.dialogs;
++            }
++        }
++        Collections.swap(sourceDialogs, sourceDialogs.indexOf(fromDialog), sourceDialogs.indexOf(toDialog));
+         updateList(null);
+     }
+ 
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Adapters/DialogsSearchAdapter.java b/TMessagesProj/src/main/java/org/telegram/ui/Adapters/DialogsSearchAdapter.java
+index 4146704a0..8a27cab6f 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/Adapters/DialogsSearchAdapter.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Adapters/DialogsSearchAdapter.java
+@@ -36,6 +36,7 @@ import org.telegram.messenger.AndroidUtilities;
+ import org.telegram.messenger.ChatObject;
+ import org.telegram.messenger.ContactsController;
+ import org.telegram.messenger.DialogObject;
++import org.telegram.messenger.PrivateChatLock;
+ import org.telegram.messenger.FileLog;
+ import org.telegram.messenger.LocaleController;
+ import org.telegram.messenger.MediaDataController;
+@@ -89,6 +90,8 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
+     public final static int VIEW_TYPE_INVITE_CONTACT_CELL = 8;
+     public final static int VIEW_TYPE_PUBLIC_POST = 9;
+     public final static int VIEW_TYPE_EMPTY_RESULT = 10;
++    public final static int VIEW_TYPE_LOCKED_CHATS = 11;
++    public static final Object LOCKED_CHATS_ITEM = new Object();
+ 
+     public static enum Filter {
+         All(0, R.string.SearchMessagesFilterAll, R.string.SearchMessagesFilterAllFrom),
+@@ -163,6 +166,7 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
+     public View showMoreHeader;
+     private Runnable cancelShowMoreAnimation;
+     private ArrayList<Long> filterDialogIds;
++    private boolean showLockedChatsForCode;
+     private final DialogsActivity dialogsActivity;
+     private final Theme.ResourcesProvider resourcesProvider;
+ 
+@@ -184,6 +188,31 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
+         this.filterDialogIds = filterDialogIds;
+     }
+ 
++    public void setShowLockedChatsForCode(boolean show) {
++        if (showLockedChatsForCode == show) {
++            return;
++        }
++        showLockedChatsForCode = show;
++        if (show) {
++            addLockedChatsItem(searchResult, searchResultNames);
++        } else {
++            int index = searchResult.indexOf(LOCKED_CHATS_ITEM);
++            if (index >= 0) {
++                searchResult.remove(index);
++                searchResultNames.remove(index);
++            }
++        }
++        searchAdapterHelper.mergeResults(searchResult, filtered2RecentSearchObjects);
++        notifyDataSetChanged();
++    }
++
++    private void addLockedChatsItem(ArrayList<Object> results, ArrayList<CharSequence> names) {
++        if (!results.contains(LOCKED_CHATS_ITEM)) {
++            results.add(0, LOCKED_CHATS_ITEM);
++            names.add(0, "Locked chats");
++        }
++    }
++
+     public boolean isSearching() {
+         return waitingResponseCount > 0;
+     }
+@@ -1071,6 +1100,9 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
+                 }
+             }
+             MessagesController.getInstance(currentAccount).putUsers(encUsers, true);
++            if (showLockedChatsForCode) {
++                addLockedChatsItem(result, names);
++            }
+             searchResult = result;
+             searchResultNames = names;
+          //   searchContacts = contacts;
+@@ -1627,6 +1659,9 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
+             case VIEW_TYPE_PROFILE_CELL:
+                 view = new ProfileSearchCell(mContext).showPremiumBlock(dialogsType == DialogsActivity.DIALOGS_TYPE_FORWARD);
+                 break;
++            case VIEW_TYPE_LOCKED_CHATS:
++                view = new TextCell(mContext, 16, false);
++                break;
+             case VIEW_TYPE_GRAY_SECTION:
+                 view = new GraySectionCell(mContext);
+                 break;
+@@ -1731,6 +1766,12 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
+     @Override
+     public void onBindViewHolder(RecyclerView.ViewHolder holder, int position) {
+         switch (holder.getItemViewType()) {
++            case VIEW_TYPE_LOCKED_CHATS: {
++                TextCell cell = (TextCell) holder.itemView;
++                cell.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
++                cell.setTextAndIcon("Locked chats", R.drawable.outline_header_lock_24, false);
++                break;
++            }
+             case VIEW_TYPE_PROFILE_CELL: {
+                 ProfileSearchCell cell = (ProfileSearchCell) holder.itemView;
+                 cell.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
+@@ -2277,6 +2318,9 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
+         int localMessagesCount = (searchForumResultMessages.isEmpty() ? 0 : searchForumResultMessages.size() + 1);
+ 
+         if (i >= 0 && i < localCount) {
++            if (searchResult.get(i) == LOCKED_CHATS_ITEM) {
++                return VIEW_TYPE_LOCKED_CHATS;
++            }
+             return VIEW_TYPE_PROFILE_CELL;
+         }
+         i -= localCount;
+@@ -2349,7 +2393,8 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
+             filteredRecentSearchObjects.clear();
+             final int count = recentSearchObjects.size();
+             for (int i = 0; i < count; ++i) {
+-                if (delegate != null && delegate.getSearchForumDialogId() == recentSearchObjects.get(i).did || !filter(recentSearchObjects.get(i).object)) {
++                if ((PrivateChatLock.isHideLocked(currentAccount) && PrivateChatLock.isLocked(currentAccount, recentSearchObjects.get(i).did)) ||
++                        (delegate != null && delegate.getSearchForumDialogId() == recentSearchObjects.get(i).did) || !filter(recentSearchObjects.get(i).object)) {
+                     continue;
+                 }
+                 filteredRecentSearchObjects.add(recentSearchObjects.get(i));
+@@ -2363,7 +2408,8 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
+             if (obj == null || obj.object == null) {
+                 continue;
+             }
+-            if (delegate != null && delegate.getSearchForumDialogId() == obj.did || !filter(recentSearchObjects.get(i).object)) {
++            if ((PrivateChatLock.isHideLocked(currentAccount) && PrivateChatLock.isLocked(currentAccount, obj.did)) ||
++                    (delegate != null && delegate.getSearchForumDialogId() == obj.did) || !filter(obj.object)) {
+                 continue;
+             }
+             String title = null, username = null;
+@@ -2387,6 +2433,11 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
+         }
+     }
+ 
++    public void refreshRecentLockState() {
++        filterRecent(lastSearchText != null ? lastSearchText.trim() : null);
++        notifyDataSetChanged();
++    }
++
+     private boolean wordStartsWith(String loweredTitle, String loweredQuery) {
+         if (loweredQuery == null || loweredTitle == null) {
+             return false;
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Cells/DialogCell.java b/TMessagesProj/src/main/java/org/telegram/ui/Cells/DialogCell.java
+index 0fae7fdda..e460f8009 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/Cells/DialogCell.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Cells/DialogCell.java
+@@ -80,6 +80,7 @@ import org.telegram.messenger.MessageObject;
+ import org.telegram.messenger.MessagesController;
+ import org.telegram.messenger.MessagesStorage;
+ import org.telegram.messenger.NotificationCenter;
++import org.telegram.messenger.PrivateChatLock;
+ import org.telegram.messenger.R;
+ import org.telegram.messenger.SharedConfig;
+ import org.telegram.messenger.UserConfig;
+@@ -1451,6 +1452,19 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
+                 }
+             }
+ 
++            if (!isTopic && PrivateChatLock.isLocked(currentAccount, currentDialogId) && !PrivateChatLock.isHideLocked(currentAccount)) {
++                drawNameLock = true;
++                boolean threeLines = useForceThreeLines || SharedConfig.useThreeLinesLayout;
++                nameLockTop = dp(threeLines ? 12.5f : 16.5f);
++                if (!LocaleController.isRTL) {
++                    nameLockLeft = dp(messagePaddingStart + (threeLines ? 6 : 4));
++                    nameLeft = dp(messagePaddingStart + (threeLines ? 10 : 8)) + Theme.dialogs_lockDrawable.getIntrinsicWidth();
++                } else {
++                    nameLockLeft = getMeasuredWidth() - dp(messagePaddingStart + (threeLines ? 6 : 4)) - Theme.dialogs_lockDrawable.getIntrinsicWidth();
++                    nameLeft = dp(threeLines ? 22 : 18);
++                }
++            }
++
+             if (encryptedChat != null) {
+                 if (currentDialogFolderId == 0) {
+                     drawNameLock = true;
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Cells/ProfileSearchCell.java b/TMessagesProj/src/main/java/org/telegram/ui/Cells/ProfileSearchCell.java
+index af32ccff6..6955efdc6 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/Cells/ProfileSearchCell.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Cells/ProfileSearchCell.java
+@@ -36,6 +36,7 @@ import org.telegram.messenger.AndroidUtilities;
+ import org.telegram.messenger.ChatObject;
+ import org.telegram.messenger.ContactsController;
+ import org.telegram.messenger.DialogObject;
++import org.telegram.messenger.PrivateChatLock;
+ import org.telegram.messenger.Emoji;
+ import org.telegram.messenger.ImageLocation;
+ import org.telegram.messenger.ImageReceiver;
+@@ -484,6 +485,16 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
+                 });
+             }
+         }
++        if ((user != null || chat != null) && PrivateChatLock.isLocked(currentAccount, dialog_id) && !PrivateChatLock.isHideLocked(currentAccount)) {
++            drawNameLock = true;
++            nameLockTop = dp(21);
++            if (!LocaleController.isRTL) {
++                nameLockLeft = dp(AndroidUtilities.leftBaseline);
++                nameLeft = dp(AndroidUtilities.leftBaseline + 4) + Theme.dialogs_lockDrawable.getIntrinsicWidth();
++            } else {
++                nameLockLeft = getMeasuredWidth() - dp(AndroidUtilities.leftBaseline + 2) - Theme.dialogs_lockDrawable.getIntrinsicWidth();
++            }
++        }
+         if (!LocaleController.isRTL) {
+             statusLeft = dp(AndroidUtilities.leftBaseline);
+         } else {
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
+index 87afb3944..2f087f07b 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
+@@ -106,6 +106,7 @@ import android.widget.ImageView;
+ import android.widget.LinearLayout;
+ import android.widget.Space;
+ import android.widget.TextView;
++import android.widget.Toast;
+ 
+ import androidx.annotation.DrawableRes;
+ import androidx.annotation.NonNull;
+@@ -178,6 +179,7 @@ import org.telegram.messenger.MessagesController;
+ import org.telegram.messenger.MessagesStorage;
+ import org.telegram.messenger.NotificationCenter;
+ import org.telegram.messenger.NotificationsController;
++import org.telegram.messenger.PrivateChatLock;
+ import org.telegram.messenger.R;
+ import org.telegram.messenger.RichMessageLayout;
+ import org.telegram.messenger.RichQuote;
+@@ -1661,6 +1663,8 @@ public class ChatActivity extends BaseFragment implements
+     private final static int change_colors = 27;
+     private final static int tag_message = 28;
+     private final static int boost_group = 29;
++    private final static int lock_chat = 34;
++    private final static int unlock_chat = 35;
+ 
+     private final static int bot_help = 30;
+     private final static int bot_settings = 31;
+@@ -3870,6 +3874,15 @@ public class ChatActivity extends BaseFragment implements
+                         return;
+                     }
+                     showDialog(AlertsCreator.createTTLAlert(getParentActivity(), currentEncryptedChat, themeDelegate).create());
++                } else if (id == lock_chat) {
++                    lockCurrentChat();
++                } else if (id == unlock_chat) {
++                    PrivateChatLock.setLocked(currentAccount, getDialogId(), false);
++                    getNotificationCenter().postNotificationName(NotificationCenter.dialogsNeedReload);
++                    if (headerItem != null) {
++                        headerItem.hideSubItem(unlock_chat);
++                        headerItem.showSubItem(lock_chat);
++                    }
+                 } else if (id == clear_history || id == delete_chat || id == auto_delete_timer) {
+                     if (getParentActivity() == null) {
+                         return;
+@@ -4493,6 +4506,11 @@ public class ChatActivity extends BaseFragment implements
+             if (!isTopic && !ChatObject.isMonoForum(currentChat)) {
+                 clearHistoryItem = headerItem.lazilyAddSubItem(clear_history, R.drawable.msg_clear,
+                     LocaleController.getString(UserObject.isBotForum(currentUser) ? R.string.ClearAllHistory : R.string.ClearHistory));
++                if (PrivateChatLock.isLocked(currentAccount, getDialogId())) {
++                    headerItem.lazilyAddSubItem(unlock_chat, R.drawable.outline_header_lock_24, "Unlock chat");
++                } else {
++                    headerItem.lazilyAddSubItem(lock_chat, R.drawable.outline_header_lock_24, "Lock chat");
++                }
+             }
+             boolean addedSettings = false;
+             if (!isTopic) {
+@@ -16853,6 +16871,29 @@ public class ChatActivity extends BaseFragment implements
+         }
+     }
+ 
++    private void lockCurrentChat() {
++        if (dialog_id == 0 || getParentActivity() == null) {
++            return;
++        }
++        showDialog(new AlertDialog.Builder(getParentActivity())
++                .setTitle(LocaleController.getString(R.string.LockChatsWarningTitle))
++                .setMessage(LocaleController.getString(R.string.LockChatsWarningText))
++                .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
++                .setPositiveButton(LocaleController.getString(R.string.LockChatsWarningConfirm), (dialog, which) -> lockCurrentChatAfterWarning())
++                .create());
++    }
++
++    private void lockCurrentChatAfterWarning() {
++        if (!PrivateChatLock.hasCode(currentAccount)) {
++            ArrayList<Long> dialogIds = new ArrayList<>();
++            dialogIds.add(dialog_id);
++            presentFragment(new PasscodeActivity(PasscodeActivity.TYPE_SETUP_PRIVATE_CODE, dialogIds), true);
++        } else {
++            PrivateChatLock.setLocked(currentAccount, dialog_id, true);
++            finishFragment();
++        }
++    }
++
+     private int getScrollOffsetForMessage(MessageObject object) {
+         return getScrollOffsetForMessage(getHeightForMessage(object, !TextUtils.isEmpty(highlightMessageQuote))) - scrollOffsetForQuote(object);
+     }
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
+index 48ec85be8..58c2ec99b 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
+@@ -58,6 +58,7 @@ import android.text.SpannableStringBuilder;
+ import android.text.Spanned;
+ import android.text.TextPaint;
+ import android.text.TextUtils;
++import android.text.InputType;
+ import android.text.style.ImageSpan;
+ import android.util.LongSparseArray;
+ import android.util.Property;
+@@ -84,6 +85,8 @@ import android.widget.Toast;
+ 
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
++import androidx.biometric.BiometricManager;
++import androidx.biometric.BiometricPrompt;
+ import androidx.core.content.ContextCompat;
+ import androidx.core.graphics.ColorUtils;
+ import androidx.core.graphics.Insets;
+@@ -123,6 +126,7 @@ import org.telegram.messenger.MessagesController;
+ import org.telegram.messenger.MessagesStorage;
+ import org.telegram.messenger.NotificationCenter;
+ import org.telegram.messenger.NotificationsController;
++import org.telegram.messenger.PrivateChatLock;
+ import org.telegram.messenger.R;
+ import org.telegram.messenger.SharedConfig;
+ import org.telegram.messenger.UserConfig;
+@@ -237,6 +241,7 @@ import org.telegram.ui.Components.FragmentContextView;
+ import org.telegram.ui.Components.ItemOptions;
+ import org.telegram.ui.Components.JoinGroupAlert;
+ import org.telegram.ui.Components.LayoutHelper;
++import org.telegram.ui.Components.EditTextBoldCursor;
+ import org.telegram.ui.Components.MediaActivity;
+ import org.telegram.ui.Components.NumberTextView;
+ import org.telegram.ui.Components.PacmanAnimation;
+@@ -273,6 +278,7 @@ import org.telegram.ui.community.cells.CommunityRequestsCell;
+ 
+ import java.io.File;
+ import java.util.ArrayList;
++import java.util.concurrent.Executor;
+ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.HashSet;
+@@ -591,6 +597,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+     private ActionBarMenuSubItem readItem;
+     @Nullable
+     private ActionBarMenuSubItem blockItem;
++    @Nullable
++    private ActionBarMenuSubItem lockChatItem;
++    @Nullable
++    private ActionBarMenuSubItem unlockChatItem;
+ 
+     private float additionalFloatingTranslation;
+     private float floatingButtonPanOffset;
+@@ -674,6 +684,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+     private CharSequence sharedTextSeed;
+     private ShareTopView shareTopView;
+     private Runnable shareLinkSearchRunnable;
++    private Runnable privateChatCodeCheckRunnable;
+ 
+     private ArrayList<Long> selectedDialogs = new ArrayList<>();
+     public boolean notify = true;
+@@ -712,6 +723,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+     private final static int add_to_folder = 109;
+     private final static int remove_from_folder = 110;
+     private final static int community_ungroup = 111;
++    private final static int lock_chat = 112;
++    private final static int unlock_chat = 113;
++
+ 
+     private final static int ARCHIVE_ITEM_STATE_PINNED = 0;
+     private final static int ARCHIVE_ITEM_STATE_SHOWED = 1;
+@@ -3377,6 +3391,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+ 
+             @Override
+             public void onSearchCollapse() {
++                if (searchViewPager != null && searchViewPager.dialogsSearchAdapter != null) {
++                    searchViewPager.dialogsSearchAdapter.setShowLockedChatsForCode(false);
++                }
+                 if (fragmentSearchField != null) {
+                     fragmentSearchField.clearSearchFiltersWithCallback();
+                 }
+@@ -3405,6 +3422,23 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+                     }
+                 }
+                 if (searchViewPager != null) {
++                    AndroidUtilities.cancelRunOnUIThread(privateChatCodeCheckRunnable);
++                    privateChatCodeCheckRunnable = null;
++                    if (searchViewPager.dialogsSearchAdapter != null) {
++                        searchViewPager.dialogsSearchAdapter.setShowLockedChatsForCode(false);
++                    }
++                    if (text.length() >= 4 && PrivateChatLock.hasCode(currentAccount)) {
++                        final String codeCandidate = text;
++                        privateChatCodeCheckRunnable = () -> {
++                            if (fragmentSearchField != null && codeCandidate.equals(fragmentSearchField.editText.getText().toString()) && PrivateChatLock.checkCode(currentAccount, codeCandidate)) {
++                                if (searchViewPager != null && searchViewPager.dialogsSearchAdapter != null) {
++                                    searchViewPager.dialogsSearchAdapter.setShowLockedChatsForCode(true);
++                                }
++                            }
++                        };
++                        AndroidUtilities.runOnUIThread(privateChatCodeCheckRunnable, 300);
++                    }
++                    updatePrivateChatSearchFilter();
+                     searchViewPager.onTextChanged(text);
+                 }
+             }
+@@ -3521,7 +3555,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+                 actionBar.setTitle(ssb, statusDrawable);
+                 updateStatus(UserConfig.getInstance(currentAccount).getCurrentUser(), false);
+             }
+-            if (folderId == 0) {
++            if (folderId == 0 && PrivateChatLock.isHideLocked(currentAccount)) {
+                 actionBar.setSupportsHolidayImage(true);
+             }
+         }
+@@ -4008,6 +4042,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+                         undoView.showWithAction(did, UndoView.ACTION_REMOVED_FROM_FOLDER, neverShow.size(), filter, null, null);
+                     }
+                     hideActionMode(false);
++                } else if (id == lock_chat) {
++                    setSelectedChatsLocked(true);
++                } else if (id == unlock_chat) {
++                    setSelectedChatsLocked(false);
+                 } else if (id == pin || id == read || id == delete || id == clear || id == mute || id == archive || id == block || id == archive2 || id == pin2) {
+                     performSelectedDialogsAction(selectedDialogs, id, true, false);
+                 }
+@@ -6750,6 +6788,8 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+         readItem = otherItem.addSubItem(read, R.drawable.msg_markread, LocaleController.getString(R.string.MarkAsRead));
+         clearItem = otherItem.addSubItem(clear, R.drawable.msg_clear, LocaleController.getString(R.string.ClearHistory));
+         blockItem = otherItem.addSubItem(block, R.drawable.msg_block, LocaleController.getString(R.string.BlockUser));
++        lockChatItem = otherItem.addSubItem(lock_chat, R.drawable.outline_header_lock_24, "Lock chat");
++        unlockChatItem = otherItem.addSubItem(unlock_chat, R.drawable.outline_header_lock_24, "Unlock chat");
+ 
+         muteItem.setOnLongClickListener(e -> {
+             performSelectedDialogsAction(selectedDialogs, mute, true, true);
+@@ -7043,6 +7083,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+         }
+         if (searchViewPager != null) {
+             searchViewPager.onResume();
++            if (searchViewPager.dialogsSearchAdapter != null) {
++                searchViewPager.dialogsSearchAdapter.refreshRecentLockState();
++            }
+         }
+         final boolean tosAccepted;
+         if (!afterSignup) {
+@@ -7238,6 +7281,8 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+     @Override
+     public void onPause() {
+         super.onPause();
++        AndroidUtilities.cancelRunOnUIThread(privateChatCodeCheckRunnable);
++        privateChatCodeCheckRunnable = null;
+         if (storiesBulletin != null) {
+             storiesBulletin.hide();
+             storiesBulletin = null;
+@@ -7995,6 +8040,11 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+             return;
+         }
+ 
++        if (!onlySelect && PrivateChatLock.isLocked(currentAccount, dialogId)) {
++            authenticateAndOpenPrivateChat(dialogId);
++            return;
++        }
++
+         if (onlySelect) {
+             if (!validateSlowModeDialog(dialogId)) {
+                 return;
+@@ -9759,6 +9809,19 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+             return;
+         }
+         int count = selectedDialogs.size();
++        boolean allChatsLocked = count > 0;
++        for (Long dialogId : selectedDialogs) {
++            if (!PrivateChatLock.isLocked(currentAccount, dialogId)) {
++                allChatsLocked = false;
++                break;
++            }
++        }
++        if (lockChatItem != null) {
++            lockChatItem.setVisibility(allChatsLocked ? View.GONE : View.VISIBLE);
++        }
++        if (unlockChatItem != null) {
++            unlockChatItem.setVisibility(allChatsLocked ? View.VISIBLE : View.GONE);
++        }
+         long selfUserId = getUserConfig().getClientUserId();
+         SharedPreferences preferences = getNotificationsSettings();
+         for (int a = 0; a < count; a++) {
+@@ -10106,6 +10169,95 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+         selectedDialogsCountTextView.setNumber(selectedDialogs.size(), updateAnimated);
+     }
+ 
++    private void setSelectedChatsLocked(boolean locked) {
++        if (selectedDialogs.isEmpty()) {
++            return;
++        }
++        if (locked) {
++            showDialog(new AlertDialog.Builder(getParentActivity())
++                    .setTitle(LocaleController.getString(R.string.LockChatsWarningTitle))
++                    .setMessage(LocaleController.getString(R.string.LockChatsWarningText))
++                    .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
++                    .setPositiveButton(LocaleController.getString(R.string.LockChatsWarningConfirm), (dialog, which) -> lockSelectedChatsAfterWarning())
++                    .create());
++            return;
++        }
++        applyChatLockState(false);
++    }
++
++    private void lockSelectedChatsAfterWarning() {
++        if (!PrivateChatLock.hasCode(currentAccount)) {
++            presentFragment(new PasscodeActivity(PasscodeActivity.TYPE_SETUP_PRIVATE_CODE, new ArrayList<>(selectedDialogs)));
++        } else {
++            applyChatLockState(true);
++        }
++    }
++
++    private void applyChatLockState(boolean locked) {
++        for (Long dialogId : new ArrayList<>(selectedDialogs)) {
++            PrivateChatLock.setLocked(currentAccount, dialogId, locked);
++        }
++        if (locked && PrivateChatLock.isHideLocked(currentAccount) && frozenDialogsList != null) {
++            frozenDialogsList.removeIf(dialog -> PrivateChatLock.isLocked(currentAccount, dialog.id));
++        }
++        hideActionMode(true);
++        updatePrivateChatSearchFilter();
++        if (viewPages != null) {
++            for (ViewPage page : viewPages) {
++                if (page != null && page.dialogsAdapter != null) {
++                    page.dialogsAdapter.notifyDataSetChanged();
++                }
++            }
++        }
++    }
++
++    private void updatePrivateChatSearchFilter() {
++        if (searchViewPager == null || searchViewPager.dialogsSearchAdapter == null) {
++            return;
++        }
++        ArrayList<Long> visibleIds = new ArrayList<>();
++        for (TLRPC.Dialog dialog : getDialogsArray(currentAccount, DIALOGS_TYPE_DEFAULT, 0, false)) {
++            visibleIds.add(dialog.id);
++        }
++        searchViewPager.dialogsSearchAdapter.setFilterDialogIds(visibleIds);
++    }
++
++    private void showLockedChats() {
++        presentFragment(new PrivateChatLockActivity());
++    }
++
++    private void showPrivateChatUnlockDialog(long dialogId) {
++        presentFragment(new PasscodeActivity(PasscodeActivity.TYPE_ENTER_PRIVATE_CODE_TO_CHAT, dialogId));
++    }
++
++    private void authenticateAndOpenPrivateChat(long dialogId) {
++        if (getParentActivity() == null || LaunchActivity.instance == null ||
++                BiometricManager.from(getParentActivity()).canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG) != BiometricManager.BIOMETRIC_SUCCESS) {
++            showPrivateChatUnlockDialog(dialogId);
++            return;
++        }
++        Executor executor = ContextCompat.getMainExecutor(getParentActivity());
++        BiometricPrompt prompt = new BiometricPrompt(LaunchActivity.instance, executor, new BiometricPrompt.AuthenticationCallback() {
++            @Override
++            public void onAuthenticationSucceeded(@NonNull BiometricPrompt.AuthenticationResult result) {
++                Bundle args = new Bundle();
++                if (DialogObject.isUserDialog(dialogId)) args.putLong("user_id", dialogId); else args.putLong("chat_id", -dialogId);
++                presentFragment(new ChatActivity(args));
++            }
++
++            @Override
++            public void onAuthenticationError(int errorCode, @NonNull CharSequence errString) {
++                showPrivateChatUnlockDialog(dialogId);
++            }
++        });
++        prompt.authenticate(new BiometricPrompt.PromptInfo.Builder()
++                .setTitle("Unlock chat")
++                .setSubtitle("Verify your identity to open this locked chat")
++                .setNegativeButtonText("Use secret code")
++                .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
++                .build());
++    }
++
+     private void closeSearch() {
+         if (AndroidUtilities.isTablet()) {
+             if (actionBar != null) {
+@@ -10512,6 +10664,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+     @Override
+     public void didReceivedNotification(int id, int account, Object... args) {
+         if (id == NotificationCenter.dialogsNeedReload) {
++            if (searchViewPager != null && searchViewPager.dialogsSearchAdapter != null) {
++                searchViewPager.dialogsSearchAdapter.refreshRecentLockState();
++            }
+             if (viewPages == null || dialogsListFrozen) {
+                 return;
+             }
+@@ -10995,7 +11150,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+         }
+         MessagesController messagesController = AccountInstance.getInstance(currentAccount).getMessagesController();
+         if (dialogsType == DIALOGS_TYPE_DEFAULT) {
+-            return messagesController.getDialogs(folderId);
++            return visibleHomeDialogs(currentAccount, messagesController.getDialogs(folderId));
+         } else if (dialogsType == DIALOGS_TYPE_WIDGET || dialogsType == DIALOGS_TYPE_IMPORT_HISTORY) {
+             return messagesController.dialogsServerOnly;
+         } else if (dialogsType == DIALOGS_TYPE_ADD_USERS_TO) {
+@@ -11035,12 +11190,12 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+         } else if (dialogsType == 7 || dialogsType == 8) {
+             MessagesController.DialogFilter dialogFilter = messagesController.selectedDialogFilter[dialogsType == 7 ? 0 : 1];
+             if (dialogFilter == null) {
+-                return messagesController.getDialogs(folderId);
++                return visibleHomeDialogs(currentAccount, messagesController.getDialogs(folderId));
+             } else {
+                 if (initialDialogsType == DIALOGS_TYPE_FORWARD) {
+                     return dialogFilter.dialogsForward;
+                 }
+-                return dialogFilter.dialogs;
++                return visibleHomeDialogs(currentAccount, dialogFilter.dialogs);
+             }
+         } else if (dialogsType == DIALOGS_TYPE_BLOCK) {
+             return messagesController.dialogsForBlock;
+@@ -11132,6 +11287,19 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+         return new ArrayList<>();
+     }
+ 
++    private ArrayList<TLRPC.Dialog> visibleHomeDialogs(int account, ArrayList<TLRPC.Dialog> dialogs) {
++        if (!PrivateChatLock.isHideLocked(account) || initialDialogsType != DIALOGS_TYPE_DEFAULT || onlySelect || communityId != 0) {
++            return dialogs;
++        }
++        ArrayList<TLRPC.Dialog> visible = new ArrayList<>(dialogs.size());
++        for (TLRPC.Dialog dialog : dialogs) {
++            if (!PrivateChatLock.isLocked(account, dialog.id)) {
++                visible.add(dialog);
++            }
++        }
++        return visible;
++    }
++
+     private boolean meetRequestPeerRequirements(TLRPC.User user) {
+         TLRPC.TL_requestPeerTypeUser type = (TLRPC.TL_requestPeerTypeUser) requestPeerType;
+         return (
+@@ -13092,6 +13260,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+ 
+             @Override
+             public void didPressedOnSubDialog(long did) {
++                if (PrivateChatLock.isLocked(currentAccount, did)) {
++                    authenticateAndOpenPrivateChat(did);
++                    return;
++                }
+                 if (onlySelect) {
+                     if (!validateSlowModeDialog(did)) {
+                         return;
+@@ -13280,6 +13452,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+         });
+         searchViewPager.searchListView.setOnItemClickListener((view, position, x, y) -> {
+             Object item = searchViewPager.dialogsSearchAdapter.getItem(position);
++            if (item == DialogsSearchAdapter.LOCKED_CHATS_ITEM) {
++                showLockedChats();
++                return;
++            }
+             if (item instanceof TLRPC.TL_sponsoredPeer) {
+                 final TLRPC.TL_sponsoredPeer peer = (TLRPC.TL_sponsoredPeer) item;
+                 final long did = DialogObject.getPeerDialogId(peer.peer);
+@@ -14481,4 +14657,4 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+         return true;
+     }
+ 
+-}
+\ No newline at end of file
++}
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/PasscodeActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/PasscodeActivity.java
+index e136a783c..17ae1b8a9 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/PasscodeActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/PasscodeActivity.java
+@@ -18,6 +18,7 @@ import android.content.Context;
+ import android.content.res.Configuration;
+ import android.graphics.Typeface;
+ import android.os.Build;
++import android.os.Bundle;
+ import android.text.Editable;
+ import android.text.InputType;
+ import android.text.TextUtils;
+@@ -48,8 +49,10 @@ import androidx.recyclerview.widget.RecyclerView;
+ 
+ import org.telegram.messenger.AndroidUtilities;
+ import org.telegram.messenger.ApplicationLoader;
++import org.telegram.messenger.DialogObject;
+ import org.telegram.messenger.FileLog;
+ import org.telegram.messenger.LocaleController;
++import org.telegram.messenger.PrivateChatLock;
+ import org.telegram.messenger.NotificationCenter;
+ import org.telegram.messenger.R;
+ import org.telegram.messenger.SharedConfig;
+@@ -95,14 +98,22 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
+     public final static int TYPE_MANAGE_CODE_SETTINGS = 0,
+             TYPE_SETUP_CODE = 1,
+             TYPE_ENTER_CODE_TO_MANAGE_SETTINGS = 2,
+-            TYPE_ENTER_CODE_TO_GRAM_WALLET = 3;
++            TYPE_ENTER_CODE_TO_GRAM_WALLET = 3,
++            TYPE_SETUP_PRIVATE_CODE = 4,
++            TYPE_ENTER_PRIVATE_CODE = 5,
++            TYPE_ENTER_PRIVATE_CODE_TO_SETTINGS = 6,
++            TYPE_ENTER_PRIVATE_CODE_TO_CHAT = 7;
+ 
+     @Retention(RetentionPolicy.SOURCE)
+     @IntDef({
+             TYPE_MANAGE_CODE_SETTINGS,
+             TYPE_SETUP_CODE,
+             TYPE_ENTER_CODE_TO_MANAGE_SETTINGS,
+-            TYPE_ENTER_CODE_TO_GRAM_WALLET
++            TYPE_ENTER_CODE_TO_GRAM_WALLET,
++            TYPE_SETUP_PRIVATE_CODE,
++            TYPE_ENTER_PRIVATE_CODE,
++            TYPE_ENTER_PRIVATE_CODE_TO_SETTINGS,
++            TYPE_ENTER_PRIVATE_CODE_TO_CHAT
+     })
+     public @interface PasscodeActivityType {}
+ 
+@@ -131,6 +142,8 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
+     private int currentPasswordType = 0;
+     private int passcodeSetStep = 0;
+     private String firstPassword;
++    private ArrayList<Long> privateDialogIds;
++    private long privateDialogId;
+ 
+     private int utyanRow;
+     private int hintRow;
+@@ -172,6 +185,20 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
+         this.type = type;
+     }
+ 
++    public PasscodeActivity(@PasscodeActivityType int type, ArrayList<Long> privateDialogIds) {
++        this(type);
++        this.privateDialogIds = privateDialogIds;
++    }
++
++    public PasscodeActivity(@PasscodeActivityType int type, long privateDialogId) {
++        this(type);
++        this.privateDialogId = privateDialogId;
++    }
++
++    private boolean isPrivateSetup() {
++        return type == TYPE_SETUP_PRIVATE_CODE;
++    }
++
+     @Override
+     public boolean onFragmentCreate() {
+         super.onFragmentCreate();
+@@ -390,6 +417,10 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
+                 break;
+             }
+             case TYPE_SETUP_CODE:
++            case TYPE_SETUP_PRIVATE_CODE:
++            case TYPE_ENTER_PRIVATE_CODE:
++            case TYPE_ENTER_PRIVATE_CODE_TO_SETTINGS:
++            case TYPE_ENTER_PRIVATE_CODE_TO_CHAT:
+             case TYPE_ENTER_CODE_TO_MANAGE_SETTINGS:
+             case TYPE_ENTER_CODE_TO_GRAM_WALLET: {
+                 if (actionBar != null) {
+@@ -451,7 +482,11 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
+                 titleTextView = new TextView(context);
+                 titleTextView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
+                 titleTextView.setTypeface(AndroidUtilities.bold());
+-                if (type == TYPE_SETUP_CODE) {
++                if (type == TYPE_ENTER_PRIVATE_CODE || type == TYPE_ENTER_PRIVATE_CODE_TO_SETTINGS || type == TYPE_ENTER_PRIVATE_CODE_TO_CHAT) {
++                    titleTextView.setText(type == TYPE_ENTER_PRIVATE_CODE_TO_CHAT ? "Enter secret code" : "Enter current secret code");
++                } else if (isPrivateSetup()) {
++                    titleTextView.setText("Enter new secret code");
++                } else if (type == TYPE_SETUP_CODE) {
+                     if (!SharedConfig.passcodeHash.isEmpty()) {
+                         titleTextView.setText(LocaleController.getString(R.string.EnterNewPasscode));
+                     } else {
+@@ -509,7 +544,7 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
+                 passwordEditText.setLines(1);
+                 passwordEditText.setGravity(LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT);
+                 passwordEditText.setSingleLine(true);
+-                if (type == TYPE_SETUP_CODE) {
++                if (type == TYPE_SETUP_CODE || isPrivateSetup()) {
+                     passcodeSetStep = 0;
+                     passwordEditText.setImeOptions(EditorInfo.IME_ACTION_NEXT);
+                 } else {
+@@ -657,7 +692,7 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
+ 
+                 innerLinearLayout.addView(codeContainer, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL, 0, 32, 0, 72));
+ 
+-                if (type == TYPE_SETUP_CODE) {
++                if (type == TYPE_SETUP_CODE || isPrivateSetup()) {
+                     frameLayout.setTag(Theme.key_windowBackgroundWhite);
+                 }
+ 
+@@ -665,13 +700,13 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
+                 VerticalPositionAutoAnimator.attach(floatingButton);
+                 frameLayout.addView(floatingButton, FragmentFloatingButton.createDefaultLayoutParamsBig());
+                 floatingButton.setOnClickListener(view -> {
+-                    if (type == TYPE_SETUP_CODE) {
++                    if (type == TYPE_SETUP_CODE || isPrivateSetup()) {
+                         if (passcodeSetStep == 0) {
+                             processNext();
+                         } else {
+                             processDone();
+                         }
+-                    } else if (type == TYPE_ENTER_CODE_TO_MANAGE_SETTINGS) {
++                    } else if (type == TYPE_ENTER_CODE_TO_MANAGE_SETTINGS || type == TYPE_ENTER_PRIVATE_CODE || type == TYPE_ENTER_PRIVATE_CODE_TO_SETTINGS || type == TYPE_ENTER_PRIVATE_CODE_TO_CHAT) {
+                         processDone();
+                     }
+                 });
+@@ -884,7 +919,11 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
+ 
+     private void updateFields() {
+         String text;
+-        if (type == TYPE_ENTER_CODE_TO_MANAGE_SETTINGS) {
++        if (isPrivateSetup()) {
++            text = passcodeSetStep == 0 ? "Please enter a 4-digit secret code" : "Re-enter your secret code to confirm";
++        } else if (type == TYPE_ENTER_PRIVATE_CODE || type == TYPE_ENTER_PRIVATE_CODE_TO_SETTINGS || type == TYPE_ENTER_PRIVATE_CODE_TO_CHAT) {
++            text = type == TYPE_ENTER_PRIVATE_CODE_TO_CHAT ? "Please enter your 4-digit secret code" : "Please enter your current 4-digit secret code";
++        } else if (type == TYPE_ENTER_CODE_TO_MANAGE_SETTINGS) {
+             text = LocaleController.getString(R.string.EnterYourPasscodeInfo);
+         } else if (type == TYPE_ENTER_CODE_TO_GRAM_WALLET) {
+             text = LocaleController.getString(R.string.WalletAuthorizeTransactionPasscode);
+@@ -893,7 +932,11 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
+         } else text = descriptionTextSwitcher.getCurrentView().getText().toString();
+ 
+         boolean animate = !(descriptionTextSwitcher.getCurrentView().getText().equals(text) || TextUtils.isEmpty(descriptionTextSwitcher.getCurrentView().getText()));
+-        if (type == TYPE_ENTER_CODE_TO_MANAGE_SETTINGS) {
++        if (isPrivateSetup()) {
++            descriptionTextSwitcher.setText(passcodeSetStep == 0 ? "Please enter a 4-digit secret code" : "Re-enter your secret code to confirm", animate);
++        } else if (type == TYPE_ENTER_PRIVATE_CODE || type == TYPE_ENTER_PRIVATE_CODE_TO_SETTINGS || type == TYPE_ENTER_PRIVATE_CODE_TO_CHAT) {
++            descriptionTextSwitcher.setText(type == TYPE_ENTER_PRIVATE_CODE_TO_CHAT ? "Please enter your 4-digit secret code" : "Please enter your current 4-digit secret code", animate);
++        } else if (type == TYPE_ENTER_CODE_TO_MANAGE_SETTINGS) {
+             descriptionTextSwitcher.setText(LocaleController.getString(R.string.EnterYourPasscodeInfo), animate);
+         } else if (type == TYPE_ENTER_CODE_TO_GRAM_WALLET) {
+             descriptionTextSwitcher.setText(LocaleController.getString(R.string.WalletAuthorizeTransactionPasscode));
+@@ -939,8 +982,8 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
+             otherItem.setVisibility(View.GONE);
+         }
+ 
+-        titleTextView.setText(LocaleController.getString(R.string.ConfirmCreatePasscode));
+-        descriptionTextSwitcher.setText(AndroidUtilities.replaceTags(LocaleController.getString(R.string.PasscodeReinstallNotice)));
++        titleTextView.setText(isPrivateSetup() ? "Re-enter your secret code" : LocaleController.getString(R.string.ConfirmCreatePasscode));
++        descriptionTextSwitcher.setText(isPrivateSetup() ? "Enter the same code again to confirm" : AndroidUtilities.replaceTags(LocaleController.getString(R.string.PasscodeReinstallNotice)));
+         firstPassword = isPinCode() ? codeFieldContainer.getCode() : passwordEditText.getText().toString();
+         passwordEditText.setText("");
+         passwordEditText.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+@@ -950,7 +993,7 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
+     }
+ 
+     private boolean isPinCode() {
+-        return type == TYPE_SETUP_CODE && currentPasswordType == SharedConfig.PASSCODE_TYPE_PIN ||
++        return type == TYPE_ENTER_PRIVATE_CODE || type == TYPE_ENTER_PRIVATE_CODE_TO_SETTINGS || type == TYPE_ENTER_PRIVATE_CODE_TO_CHAT || (type == TYPE_SETUP_CODE || isPrivateSetup()) && currentPasswordType == SharedConfig.PASSCODE_TYPE_PIN ||
+                 (type == TYPE_ENTER_CODE_TO_MANAGE_SETTINGS || type == TYPE_ENTER_CODE_TO_GRAM_WALLET) && SharedConfig.passcodeType == SharedConfig.PASSCODE_TYPE_PIN;
+     }
+ 
+@@ -965,7 +1008,39 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
+             return;
+         }
+         String password = isPinCode() ? codeFieldContainer.getCode() : passwordEditText.getText().toString();
+-        if (type == TYPE_SETUP_CODE) {
++        if (type == TYPE_ENTER_PRIVATE_CODE || type == TYPE_ENTER_PRIVATE_CODE_TO_SETTINGS || type == TYPE_ENTER_PRIVATE_CODE_TO_CHAT) {
++            long retryDelay = PrivateChatLock.getUnlockRetryDelay(currentAccount);
++            if (retryDelay > 0) {
++                Toast.makeText(getParentActivity(), "Try again in " + Math.max(1, (retryDelay + 999) / 1000) + " sec", Toast.LENGTH_SHORT).show();
++            } else if (PrivateChatLock.checkCode(currentAccount, password)) {
++                PrivateChatLock.resetUnlockFailures(currentAccount);
++                animateSuccessAnimation(() -> {
++                    if (type == TYPE_ENTER_PRIVATE_CODE_TO_CHAT) {
++                        Bundle args = new Bundle();
++                        if (DialogObject.isUserDialog(privateDialogId)) {
++                            args.putLong("user_id", privateDialogId);
++                        } else {
++                            args.putLong("chat_id", -privateDialogId);
++                        }
++                        presentFragment(new ChatActivity(args), true);
++                    } else {
++                        presentFragment(type == TYPE_ENTER_PRIVATE_CODE_TO_SETTINGS
++                                ? new PrivateChatLockActivity.PrivateChatLockSettingsActivity()
++                                : new PasscodeActivity(TYPE_SETUP_PRIVATE_CODE), true);
++                    }
++                });
++                return;
++            } else {
++                PrivateChatLock.registerUnlockFailure(currentAccount);
++            }
++            for (CodeNumberField f : codeFieldContainer.codeField) {
++                f.setText("");
++            }
++            codeFieldContainer.codeField[0].requestFocus();
++            onPasscodeError();
++            return;
++        }
++        if (type == TYPE_SETUP_CODE || isPrivateSetup()) {
+             if (!firstPassword.equals(password)) {
+                 AndroidUtilities.updateViewVisibilityAnimated(passcodesDoNotMatchTextView, true);
+                 for (CodeNumberField f : codeFieldContainer.codeField) {
+@@ -985,6 +1060,16 @@ public class PasscodeActivity extends BaseFragment implements NotificationCenter
+                 return;
+             }
+ 
++            if (isPrivateSetup()) {
++                PrivateChatLock.setCode(currentAccount, firstPassword);
++                if (privateDialogIds != null) {
++                    for (Long dialogId : privateDialogIds) {
++                        PrivateChatLock.setLocked(currentAccount, dialogId, true);
++                    }
++                }
++                animateSuccessAnimation(this::finishFragment);
++                return;
++            }
+             boolean isFirst = SharedConfig.passcodeHash.isEmpty();
+             try {
+                 SharedConfig.passcodeSalt = new byte[16];
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/PrivacySettingsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/PrivacySettingsActivity.java
+index 6ce417f1f..7b5af49e1 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/PrivacySettingsActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/PrivacySettingsActivity.java
+@@ -45,6 +45,7 @@ import org.telegram.messenger.FileLog;
+ import org.telegram.messenger.LocaleController;
+ import org.telegram.messenger.MessagesController;
+ import org.telegram.messenger.NotificationCenter;
++import org.telegram.messenger.PrivateChatLock;
+ import org.telegram.messenger.R;
+ import org.telegram.messenger.SharedConfig;
+ import org.telegram.tgnet.ConnectionsManager;
+@@ -125,6 +126,8 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
+     @Keep
+     private int passcodeRow;
+     @Keep
++    private int appLocksRow;
++    @Keep
+     private int autoDeleteMesages;
+     @Keep
+     private int passkeysRow;
+@@ -496,6 +499,10 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
+                 }
+             } else if (position == passcodeRow) {
+                 presentFragment(PasscodeActivity.determineOpenFragment());
++            } else if (position == appLocksRow) {
++                presentFragment(PrivateChatLock.hasCode(currentAccount)
++                        ? new PasscodeActivity(PasscodeActivity.TYPE_ENTER_PRIVATE_CODE_TO_SETTINGS)
++                        : new PrivateChatLockActivity.PrivateChatLockSettingsActivity());
+             } else if (position == secretWebpageRow) {
+                 if (getMessagesController().secretWebpagePreview == 1) {
+                     getMessagesController().secretWebpagePreview = 0;
+@@ -713,6 +720,7 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
+         passwordRow = rowCount++;
+         autoDeleteMesages = rowCount++;
+         passcodeRow = rowCount++;
++        appLocksRow = PrivateChatLock.hasCode(currentAccount) && PrivateChatLock.isHideLocked(currentAccount) ? -1 : rowCount++;
+         if (getMessagesController().config.settingsDisplayPasskeys.get() && Build.VERSION.SDK_INT >= 28 && BuildVars.SUPPORTS_PASSKEYS) {
+             passkeysRow = rowCount++;
+         }
+@@ -1005,7 +1013,7 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
+     public void onResume() {
+         super.onResume();
+         if (listAdapter != null) {
+-            listAdapter.notifyDataSetChanged();
++            updateRows();
+         }
+     }
+ 
+@@ -1020,7 +1028,7 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
+         @Override
+         public boolean isEnabled(RecyclerView.ViewHolder holder) {
+             int position = holder.getAdapterPosition();
+-            return position == passcodeRow || position == passwordRow || position == passkeysRow || position == blockedRow || position == sessionsRow || position == secretWebpageRow || position == webSessionsRow ||
++            return position == passcodeRow || position == appLocksRow || position == passwordRow || position == passkeysRow || position == blockedRow || position == sessionsRow || position == secretWebpageRow || position == webSessionsRow ||
+                     position == groupsRow && !getContactsController().getLoadingPrivacyInfo(ContactsController.PRIVACY_RULES_TYPE_INVITE) ||
+                     position == lastSeenRow && !getContactsController().getLoadingPrivacyInfo(ContactsController.PRIVACY_RULES_TYPE_LASTSEEN) ||
+                     position == callsRow && !getContactsController().getLoadingPrivacyInfo(ContactsController.PRIVACY_RULES_TYPE_CALLS) ||
+@@ -1370,6 +1378,9 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
+                             icon = R.drawable.msg2_secret;
+                         }
+                         textCell2.setTextAndValueAndIcon(getString(R.string.Passcode), value, true, icon, true);
++                    } else if (position == appLocksRow) {
++                        value = PrivateChatLock.hasCode(currentAccount) ? getString(R.string.PasswordOn) : getString(R.string.PasswordOff);
++                        textCell2.setTextAndValueAndIcon("Chat lock", value, true, R.drawable.msg2_secret, true);
+                     } else if (position == blockedRow) {
+                         int totalCount = getMessagesController().totalBlockedCount;
+                         if (totalCount == 0) {
+@@ -1401,7 +1412,7 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
+                 return 3;
+             } else if (position == botsAndWebsitesShadowRow) {
+                 return 4;
+-            } else if (position == autoDeleteMesages || position == sessionsRow || position == emailLoginRow || position == passwordRow || position == passkeysRow || position == passcodeRow || position == blockedRow) {
++            } else if (position == autoDeleteMesages || position == sessionsRow || position == emailLoginRow || position == passwordRow || position == passkeysRow || position == passcodeRow || position == appLocksRow || position == blockedRow) {
+                 return 5;
+             }
+             return 0;
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/PrivateChatLockActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/PrivateChatLockActivity.java
+new file mode 100644
+index 000000000..76e29810f
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/ui/PrivateChatLockActivity.java
+@@ -0,0 +1,270 @@
++package org.telegram.ui;
++
++import static org.telegram.messenger.AndroidUtilities.dp;
++
++import android.content.Context;
++import android.graphics.Color;
++import android.graphics.drawable.GradientDrawable;
++import android.os.Bundle;
++import android.view.View;
++import android.view.ViewGroup;
++import android.widget.FrameLayout;
++
++import androidx.annotation.NonNull;
++import androidx.biometric.BiometricManager;
++import androidx.biometric.BiometricPrompt;
++import androidx.core.content.ContextCompat;
++import androidx.recyclerview.widget.LinearLayoutManager;
++import androidx.recyclerview.widget.RecyclerView;
++
++import org.telegram.messenger.DialogObject;
++import org.telegram.messenger.LocaleController;
++import org.telegram.messenger.MessagesController;
++import org.telegram.messenger.PrivateChatLock;
++import org.telegram.messenger.R;
++import org.telegram.tgnet.TLRPC;
++import org.telegram.ui.ActionBar.ActionBar;
++import org.telegram.ui.ActionBar.ActionBarMenu;
++import org.telegram.ui.ActionBar.ActionBarMenuItem;
++import org.telegram.ui.ActionBar.AlertDialog;
++import org.telegram.ui.ActionBar.BaseFragment;
++import org.telegram.ui.ActionBar.Theme;
++import org.telegram.ui.Cells.HeaderCell;
++import org.telegram.ui.Cells.TextCell;
++import org.telegram.ui.Cells.TextCheckCell;
++import org.telegram.ui.Cells.TextInfoPrivacyCell;
++import org.telegram.ui.Cells.DialogCell;
++import org.telegram.ui.Components.LayoutHelper;
++import org.telegram.ui.Components.EmptyTextProgressView;
++import org.telegram.ui.Components.RecyclerListView;
++
++import java.util.ArrayList;
++import java.util.concurrent.Executor;
++
++public class PrivateChatLockActivity extends BaseFragment {
++    private final ArrayList<Long> lockedIds = new ArrayList<>();
++    private RecyclerListView listView;
++    private ListAdapter listAdapter;
++
++    @Override
++    public View createView(Context context) {
++        actionBar.setBackButtonImage(R.drawable.ic_ab_back);
++        actionBar.setAllowOverlayTitle(true);
++        actionBar.setTitle("Locked chats");
++        actionBar.setActionBarMenuOnItemClick(new ActionBar.ActionBarMenuOnItemClick() {
++            @Override
++            public void onItemClick(int id) {
++                if (id == -1) finishFragment();
++                else if (id == 1) presentFragment(new PrivateChatLockSettingsActivity());
++            }
++        });
++        ActionBarMenu menu = actionBar.createMenu();
++        ActionBarMenuItem settingsItem = menu.addItem(1, R.drawable.msg_settings);
++        settingsItem.setContentDescription("Settings");
++        lockedIds.clear();
++        lockedIds.addAll(PrivateChatLock.getLockedIds(currentAccount));
++        FrameLayout frame = new FrameLayout(context);
++        frame.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundGray));
++        EmptyTextProgressView emptyView = new EmptyTextProgressView(context);
++        emptyView.setTopImage(R.drawable.outline_header_lock_24);
++        emptyView.setText("No locked chats yet\n\nOpen a chat and choose Lock chat from its menu to add it here.");
++        emptyView.showTextView();
++        frame.addView(emptyView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
++        listView = new RecyclerListView(context);
++        actionBar.setAdaptiveBackground(listView);
++        listView.setLayoutManager(new LinearLayoutManager(context));
++        listView.setEmptyView(emptyView);
++        listView.setAdapter(listAdapter = new ListAdapter(context));
++        frame.addView(listView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
++        listView.setOnItemClickListener((view, position) -> {
++            if (position < 0 || position >= lockedIds.size()) return;
++            authenticateAndOpen(lockedIds.get(position));
++        });
++        fragmentView = frame;
++        return fragmentView;
++    }
++
++    @Override
++    public void onResume() {
++        super.onResume();
++        lockedIds.clear();
++        lockedIds.addAll(PrivateChatLock.getLockedIds(currentAccount));
++        if (listAdapter != null) {
++            listAdapter.notifyDataSetChanged();
++        }
++    }
++
++    private void authenticateAndOpen(long dialogId) {
++        if (getParentActivity() == null || LaunchActivity.instance == null ||
++                BiometricManager.from(getParentActivity()).canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG) != BiometricManager.BIOMETRIC_SUCCESS) {
++            showSecretCodeDialog(dialogId);
++            return;
++        }
++        Executor executor = ContextCompat.getMainExecutor(getParentActivity());
++        BiometricPrompt prompt = new BiometricPrompt(LaunchActivity.instance, executor, new BiometricPrompt.AuthenticationCallback() {
++            @Override
++            public void onAuthenticationSucceeded(@NonNull BiometricPrompt.AuthenticationResult result) {
++                openChat(dialogId);
++            }
++
++            @Override
++            public void onAuthenticationError(int errorCode, @NonNull CharSequence errString) {
++                showSecretCodeDialog(dialogId);
++            }
++        });
++        BiometricPrompt.PromptInfo promptInfo = new BiometricPrompt.PromptInfo.Builder()
++                .setTitle("Unlock chat")
++                .setSubtitle("Verify your identity to open this locked chat")
++                .setNegativeButtonText("Use secret code")
++                .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
++                .build();
++        prompt.authenticate(promptInfo);
++    }
++
++    private void showSecretCodeDialog(long dialogId) {
++        presentFragment(new PasscodeActivity(PasscodeActivity.TYPE_ENTER_PRIVATE_CODE_TO_CHAT, dialogId));
++    }
++
++    private void openChat(long dialogId) {
++        Bundle args = new Bundle();
++        if (DialogObject.isUserDialog(dialogId)) args.putLong("user_id", dialogId); else args.putLong("chat_id", -dialogId);
++        presentFragment(new ChatActivity(args));
++    }
++
++    private class ListAdapter extends RecyclerListView.SelectionAdapter {
++        private final Context context;
++        ListAdapter(Context context) { this.context = context; }
++        @Override public boolean isEnabled(RecyclerView.ViewHolder holder) { return true; }
++        @Override public int getItemCount() { return lockedIds.size(); }
++        @Override public RecyclerView.ViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int type) {
++            DialogCell cell = new DialogCell(null, context, false, false, currentAccount, null);
++            cell.setLayoutParams(new RecyclerView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56)));
++            return new RecyclerListView.Holder(cell);
++        }
++        @Override public void onBindViewHolder(@NonNull RecyclerView.ViewHolder holder, int position) {
++            DialogCell cell = (DialogCell) holder.itemView;
++            TLRPC.Dialog dialog = MessagesController.getInstance(currentAccount).dialogs_dict.get(lockedIds.get(position));
++            if (dialog != null) {
++                cell.setDialog(dialog, DialogsActivity.DIALOGS_TYPE_DEFAULT, 0);
++            }
++        }
++    }
++
++    public static class PrivateChatLockSettingsActivity extends BaseFragment {
++        private TextCheckCell hideCell;
++        private SettingsAdapter settingsAdapter;
++
++        @Override
++        public View createView(Context context) {
++            actionBar.setBackButtonImage(R.drawable.ic_ab_back);
++            actionBar.setAllowOverlayTitle(true);
++            actionBar.setTitle("Chat lock settings");
++            actionBar.setActionBarMenuOnItemClick(new ActionBar.ActionBarMenuOnItemClick() {
++                @Override
++                public void onItemClick(int id) { if (id == -1) finishFragment(); }
++            });
++            FrameLayout frame = new FrameLayout(context);
++            frame.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundGray));
++            RecyclerListView listView = new RecyclerListView(context);
++            actionBar.setAdaptiveBackground(listView);
++            listView.setClipToPadding(false);
++            listView.setPadding(dp(16), dp(12), dp(16), 0);
++            listView.setLayoutManager(new LinearLayoutManager(context));
++            settingsAdapter = new SettingsAdapter(context);
++            listView.setAdapter(settingsAdapter);
++            frame.addView(listView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
++            listView.setOnItemClickListener((view, position) -> {
++                if (position == 0) {
++                    boolean hide = !PrivateChatLock.isHideLocked(currentAccount);
++                    if (hide) {
++                        showDialog(new AlertDialog.Builder(getParentActivity())
++                                .setTitle("Hide secret chats")
++                                .setMessage("Hide your chats with a secret code for more privacy. Find locked chats by entering your code in the search bar on the Chats tab. Your chats will appear after you enter the code.")
++                                .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
++                                .setPositiveButton("Hide chats", (dialog, which) -> {
++                                    PrivateChatLock.setHideLocked(currentAccount, true);
++                                    hideCell.setChecked(true);
++                                    settingsAdapter.notifyDataSetChanged();
++                                }).create());
++                    } else {
++                        PrivateChatLock.setHideLocked(currentAccount, false);
++                        hideCell.setChecked(false);
++                        settingsAdapter.notifyDataSetChanged();
++                    }
++                } else if (!PrivateChatLock.isHideLocked(currentAccount) && position == 1) {
++                    presentFragment(new PrivateChatLockActivity());
++                } else if (position == (PrivateChatLock.isHideLocked(currentAccount) ? 1 : 2)) {
++                    requestCurrentSecretCode();
++                }
++            });
++            fragmentView = frame;
++            return fragmentView;
++        }
++
++        @Override
++        public void onResume() {
++            super.onResume();
++            if (settingsAdapter != null) {
++                settingsAdapter.notifyDataSetChanged();
++            }
++        }
++
++        private void requestCurrentSecretCode() {
++            if (!PrivateChatLock.hasCode(currentAccount)) {
++                presentFragment(new ActionIntroActivity(ActionIntroActivity.ACTION_TYPE_SET_PRIVATE_CODE));
++                return;
++            }
++            presentFragment(new PasscodeActivity(PasscodeActivity.TYPE_ENTER_PRIVATE_CODE));
++        }
++
++        private class SettingsAdapter extends RecyclerListView.SelectionAdapter {
++            private final Context context;
++            SettingsAdapter(Context context) { this.context = context; }
++            @Override public boolean isEnabled(RecyclerView.ViewHolder holder) { return true; }
++            @Override public int getItemCount() { return PrivateChatLock.isHideLocked(currentAccount) ? 4 : 5; }
++            @Override public int getItemViewType(int position) {
++                if (position == 0) return 0;
++                int secretCodePosition = PrivateChatLock.isHideLocked(currentAccount) ? 1 : 2;
++                return position == 1 && !PrivateChatLock.isHideLocked(currentAccount) || position == secretCodePosition ? 1 : position == secretCodePosition + 1 ? 2 : 3;
++            }
++            @Override public RecyclerView.ViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int type) {
++                View view;
++                if (type == 0) view = hideCell = new TextCheckCell(context);
++                else if (type == 1) view = new TextCell(context);
++                else if (type == 2) view = new HeaderCell(context);
++                else view = new TextInfoPrivacyCell(context);
++                return new RecyclerListView.Holder(view);
++            }
++            private void styleCell(View view, int position) {
++                int privacyPosition = PrivateChatLock.isHideLocked(currentAccount) ? 2 : 3;
++                if (position > privacyPosition - 1) {
++                    view.setBackgroundColor(Color.TRANSPARENT);
++                    return;
++                }
++                float radius = dp(16);
++                int lastCardPosition = PrivateChatLock.isHideLocked(currentAccount) ? 1 : 2;
++                float[] radii = position == 0 ? new float[] {radius, radius, radius, radius, 0, 0, 0, 0} :
++                        position == lastCardPosition ? new float[] {0, 0, 0, 0, radius, radius, radius, radius} :
++                        new float[] {0, 0, 0, 0, 0, 0, 0, 0};
++                GradientDrawable background = new GradientDrawable();
++                background.setColor(Theme.getColor(Theme.key_windowBackgroundWhite));
++                background.setCornerRadii(radii);
++                view.setBackground(background);
++            }
++            @Override public void onBindViewHolder(@NonNull RecyclerView.ViewHolder holder, int position) {
++                styleCell(holder.itemView, position);
++                if (position == 0) {
++                    hideCell.setTextAndCheck("Hide secret chats", PrivateChatLock.isHideLocked(currentAccount), false);
++                } else if (!PrivateChatLock.isHideLocked(currentAccount) && position == 1) {
++                    ((TextCell) holder.itemView).setTextAndIcon("Locked chats", R.drawable.outline_header_lock_24, true);
++                } else if (position == (PrivateChatLock.isHideLocked(currentAccount) ? 1 : 2)) {
++                    ((TextCell) holder.itemView).setTextAndIcon(PrivateChatLock.hasCode(currentAccount) ? "Change secret code" : "Set secret code", R.drawable.outline_header_lock_24, true);
++                } else if (position == (PrivateChatLock.isHideLocked(currentAccount) ? 2 : 3)) {
++                    ((HeaderCell) holder.itemView).setText("Privacy");
++                } else {
++                    ((TextInfoPrivacyCell) holder.itemView).setText("Locked chats require your secret code to open. When Hide secret chats is off, they remain in the list with a lock icon.");
++                }
++            }
++        }
++    }
++}
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/PrivateChatLockCodeActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/PrivateChatLockCodeActivity.java
+new file mode 100644
+index 000000000..7a48ec8ef
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/ui/PrivateChatLockCodeActivity.java
+@@ -0,0 +1,118 @@
++package org.telegram.ui;
++
++import static org.telegram.messenger.AndroidUtilities.dp;
++
++import android.content.Context;
++import android.text.InputType;
++import android.view.View;
++import android.view.inputmethod.EditorInfo;
++import android.widget.LinearLayout;
++import android.widget.Toast;
++
++import org.telegram.messenger.AndroidUtilities;
++import org.telegram.messenger.LocaleController;
++import org.telegram.messenger.PrivateChatLock;
++import org.telegram.messenger.R;
++import org.telegram.ui.ActionBar.ActionBar;
++import org.telegram.ui.ActionBar.ActionBarMenu;
++import org.telegram.ui.ActionBar.ActionBarMenuItem;
++import org.telegram.ui.ActionBar.BaseFragment;
++import org.telegram.ui.ActionBar.Theme;
++import org.telegram.ui.Cells.EditTextSettingsCell;
++import org.telegram.ui.Cells.HeaderCell;
++import org.telegram.ui.Cells.TextInfoPrivacyCell;
++import org.telegram.ui.Components.LayoutHelper;
++
++import java.util.ArrayList;
++
++public class PrivateChatLockCodeActivity extends BaseFragment {
++    private final ArrayList<Long> dialogIds;
++    private EditTextSettingsCell codeField;
++    private EditTextSettingsCell confirmationField;
++
++    public PrivateChatLockCodeActivity(ArrayList<Long> dialogIds) {
++        this.dialogIds = dialogIds;
++    }
++
++    @Override
++    public View createView(Context context) {
++        actionBar.setBackButtonImage(R.drawable.ic_ab_back);
++        actionBar.setTitle(dialogIds == null ? "Change secret code" : "Set secret code");
++        actionBar.setActionBarMenuOnItemClick(new ActionBar.ActionBarMenuOnItemClick() {
++            @Override
++            public void onItemClick(int id) {
++                if (id == -1) {
++                    finishFragment();
++                } else if (id == 1) {
++                    saveCode();
++                }
++            }
++        });
++        ActionBarMenu menu = actionBar.createMenu();
++        ActionBarMenuItem done = menu.addItemWithWidth(1, R.drawable.ic_ab_done, dp(56));
++        done.setContentDescription(LocaleController.getString(R.string.Done));
++
++        LinearLayout layout = new LinearLayout(context);
++        layout.setOrientation(LinearLayout.VERTICAL);
++        layout.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundGray));
++        HeaderCell header = new HeaderCell(context);
++        header.setText("Secret code");
++        layout.addView(header, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
++        codeField = createCodeField(context, "Secret code");
++        layout.addView(codeField, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
++        confirmationField = createCodeField(context, "Confirm secret code");
++        confirmationField.getTextView().setImeOptions(EditorInfo.IME_ACTION_DONE);
++        confirmationField.getTextView().setOnEditorActionListener((v, actionId, event) -> {
++            if (actionId == EditorInfo.IME_ACTION_DONE) {
++                saveCode();
++                return true;
++            }
++            return false;
++        });
++        layout.addView(confirmationField, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
++        layout.addView(createInfo(context), LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
++        fragmentView = layout;
++        return fragmentView;
++    }
++
++    private TextInfoPrivacyCell createInfo(Context context) {
++        TextInfoPrivacyCell info = new TextInfoPrivacyCell(context);
++        info.setText(dialogIds == null
++                ? "Choose a new code to protect your locked chats."
++                : "Create a secret code to hide the selected chats from the chat list.");
++        return info;
++    }
++
++    private EditTextSettingsCell createCodeField(Context context, String hint) {
++        EditTextSettingsCell field = new EditTextSettingsCell(context);
++        field.setTextAndHint("", hint, true);
++        field.getTextView().setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
++        field.getTextView().setImeOptions(EditorInfo.IME_ACTION_NEXT);
++        return field;
++    }
++
++    private void saveCode() {
++        String code = codeField == null ? "" : codeField.getText();
++        String confirmation = confirmationField == null ? "" : confirmationField.getText();
++        if (code.length() < 4) {
++            Toast.makeText(getParentActivity(), "Use at least 4 digits", Toast.LENGTH_SHORT).show();
++            return;
++        }
++        if (!code.equals(confirmation)) {
++            confirmationField.getTextView().setError("Codes do not match");
++            confirmationField.getTextView().requestFocus();
++            return;
++        }
++        if (!PrivateChatLock.setCode(currentAccount, code)) {
++            Toast.makeText(getParentActivity(), "Couldn't save secret code", Toast.LENGTH_SHORT).show();
++            return;
++        }
++        if (dialogIds != null) {
++            for (Long dialogId : dialogIds) {
++                PrivateChatLock.setLocked(currentAccount, dialogId, true);
++            }
++        }
++        AndroidUtilities.hideKeyboard(codeField.getTextView());
++        finishFragment();
++    }
++}
+diff --git a/TMessagesProj/src/main/res/values/strings.xml b/TMessagesProj/src/main/res/values/strings.xml
+index db9de7556..e955bfcc2 100644
+--- a/TMessagesProj/src/main/res/values/strings.xml
++++ b/TMessagesProj/src/main/res/values/strings.xml
+@@ -11630,4 +11630,7 @@
+     <string name="NoPaidMessagesTokenUsed">un1 used your QR code and can message you for free</string>
+     <string name="NoPaidMessagesTokenUsedOut">You used the QR code of un1 and can message them for free</string>
+     <string name="NoPaidMessagesTokenImported">You can now message **%1$s** for free.</string>
++    <string name="LockChatsWarningTitle">Lock chats</string>
++    <string name="LockChatsWarningText">Locked chats require biometrics or your secret code to open and read. For added privacy, turn on Hide secret chats to remove them from your chat list. To find hidden chats, enter your secret code in the search bar on the Chats tab.</string>
++    <string name="LockChatsWarningConfirm">Lock chats</string>
+ </resources>
