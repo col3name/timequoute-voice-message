@@ -3,6 +3,13 @@
 
 ### Protect selected Telegram chats with a local lock and hide them from the chat list
 
+
+<p>
+  <a href="docs/videos/demo.mp4">
+    <img src="docs/videos/demo.gif" alt="Chat Lock demo" width="500" />
+  </a>
+</p>
+
 ## Platform
 
 Android
@@ -27,11 +34,6 @@ When **Hide secret chats** is enabled, locked chats are removed from the regular
 
 ## Demo
 
-<p align="center">
-  <a href="docs/videos/demo.mp4">
-    <img src="docs/videos/demo.gif" alt="Chat Lock demo" width="500" />
-  </a>
-</p>
 
 <p align="center">
   <img src="docs/images/1.png" alt="Chat lock in the chat list" width="30%" />
