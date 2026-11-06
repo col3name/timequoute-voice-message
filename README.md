@@ -1,4 +1,11 @@
-# Quick Photos Send
+# DRKLO Android - Quick Photos Send 
+## (based on drklo/telegram)
+
+Why
+Sending a photos should be as immediate as sending with one: press, slide, release.
+
+Here you press and hold the attach button, four local demo photos fan out of it, you slide onto one and let go. The selected photos flies directly into a new outgoing message. Release anywhere else and everything folds back.
+
 
 ### How it works
 Long-press the paperclip button to reveal four photos in an animated fan.
