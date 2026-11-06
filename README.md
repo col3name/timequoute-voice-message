@@ -15,10 +15,10 @@ Slide to select one and release to send it directly into the chat. Release elsew
 
 ## Platform - Android
 
-[demo.GIF](docs/videos/demo.gif)
+![Quick Photos Send demo](docs/videos/demo.gif)
 
-[demo.mp4](docs/videos/demo.mp4)
 
+![demo.mp4](docs/videos/demo.mp4)
 
 <img src="docs/images/1.png" alt="Quick Photos Send" width="65%">
 
