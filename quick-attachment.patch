@@ -1,0 +1,1091 @@
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
+index 87afb3944..67737ba1e 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java
+@@ -2432,6 +2432,13 @@ public class ChatActivity extends BaseFragment implements
+             openAttachMenu();
+         }
+ 
++        @Override
++        public void didPressQuickPhoto(MediaController.PhotoEntry photo) {
++            if (photo != null) {
++                sendMedia(photo, null, true, 0, 0, false, 0);
++            }
++        }
++
+         @Override
+         public void didPressSuggestionButton() {
+             new MessageSuggestionOfferSheet(getContext(), currentAccount, dialog_id, messageSuggestionParams != null ? messageSuggestionParams: MessageSuggestionParams.empty(), ChatActivity.this, getResourceProvider(), MessageSuggestionOfferSheet.MODE_INPUT, ChatActivity.this::showFieldPanelForSuggestionParams).show();
+@@ -38045,6 +38052,11 @@ public class ChatActivity extends BaseFragment implements
+ 
+                     messageCell.setShowTopic(true);
+                     messageCell.setMessageObject(message, groupedMessages, pinnedBottom, pinnedTop, firstInChat, lastInChatList);
++                    if (chatActivityEnterView != null) {
++                        if (chatActivityEnterView.tryStartQuickPhotoTransition(messageCell)) {
++                            animatingMessageObjects.remove(message);
++                        }
++                    }
+                     messageCell.setSpoilersSuppressed(chatListView.getScrollState() != RecyclerView.SCROLL_STATE_IDLE);
+                     messageCell.setHighlighted(highlightMessageId != Integer.MAX_VALUE && message.getId() == highlightMessageId);
+                     if (messageCell.isHighlighted() && highlightMessageQuote != null) {
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/ChatActivityEnterView.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/ChatActivityEnterView.java
+index 16a3823b5..076a933ed 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/Components/ChatActivityEnterView.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/ChatActivityEnterView.java
+@@ -79,6 +79,7 @@ import android.view.ViewConfiguration;
+ import android.view.ViewGroup;
+ import android.view.ViewPropertyAnimator;
+ import android.view.ViewTreeObserver;
++import android.view.TouchDelegate;
+ import android.view.WindowInsets;
+ import android.view.WindowManager;
+ import android.view.accessibility.AccessibilityEvent;
+@@ -176,6 +177,7 @@ import org.telegram.ui.ActionBar.Theme;
+ import org.telegram.ui.BasePermissionsActivity;
+ import org.telegram.ui.Business.BusinessLinksController;
+ import org.telegram.ui.Business.QuickRepliesController;
++import org.telegram.ui.Cells.ChatMessageCell;
+ import org.telegram.ui.ChatActivity;
+ import org.telegram.ui.Components.Forum.ForumUtilities;
+ import org.telegram.ui.Components.Premium.PremiumFeatureBottomSheet;
+@@ -320,6 +322,10 @@ public class ChatActivityEnterView extends FrameLayout implements
+ 
+         void didPressAttachButton();
+ 
++        default void didPressQuickPhoto(MediaController.PhotoEntry photo) {
++            didPressAttachButton();
++        }
++
+         default void didPressStreamingStop() {}
+ 
+         default void didPressSuggestionButton() {}
+@@ -637,6 +643,15 @@ public class ChatActivityEnterView extends FrameLayout implements
+     private LinearLayout attachLayout;
+     private ViewPropertyAnimator attachButtonAnimator;
+     private ImageView attachButton;
++    private QuickAttachmentOverlayView quickAttachmentOverlay;
++    private MessageObject quickPhotoMessageObject;
++    private boolean quickPhotoTransitionPending;
++    private Runnable quickAttachmentLongPress;
++    private boolean quickAttachmentTracking;
++    private boolean quickAttachmentLongPressTriggered;
++    private boolean quickAttachmentSuppressTap;
++    private float quickAttachmentDownX;
++    private float quickAttachmentDownY;
+     private AiButtonDrawable aiButtonIcon;
+     private ImageView aiButton;
+     private ImageView richButton;
+@@ -2830,6 +2845,53 @@ public class ChatActivityEnterView extends FrameLayout implements
+                 @Override
+                 public boolean dispatchTouchEvent(MotionEvent event) {
+                     if (getAlpha() < 0.5f) return false;
++                    if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
++                        quickAttachmentTracking = false;
++                        quickAttachmentLongPressTriggered = false;
++                        quickAttachmentSuppressTap = false;
++                        quickAttachmentDownX = event.getX();
++                        quickAttachmentDownY = event.getY();
++                        quickAttachmentLongPress = () -> {
++                            quickAttachmentLongPress = null;
++                            // Claim the gesture before checking layout readiness.
++                            // On the first chat frame the attach layout can still
++                            // be at alpha 0; ACTION_UP must not fall through to
++                            // the legacy tap action in that case.
++                            quickAttachmentLongPressTriggered = true;
++                            quickAttachmentTracking = true;
++                            quickAttachmentSuppressTap = true;
++                            if (getAlpha() < 0.5f || adjustPanLayoutHelper != null && adjustPanLayoutHelper.animationInProgress() || attachLayoutPaddingAlpha == 0f) {
++                                return;
++                            }
++                            showQuickAttachmentOverlay(this);
++                        };
++                        postDelayed(quickAttachmentLongPress, 150);
++                    } else if (quickAttachmentTracking) {
++                        if (event.getActionMasked() == MotionEvent.ACTION_MOVE) {
++                            updateQuickAttachmentOverlay(event);
++                        } else if (event.getActionMasked() == MotionEvent.ACTION_UP) {
++                            finishQuickAttachmentOverlay(event, false);
++                            quickAttachmentLongPressTriggered = false;
++                        } else if (event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
++                            finishQuickAttachmentOverlay(event, true);
++                            quickAttachmentLongPressTriggered = false;
++                        }
++                        return true;
++                    } else if (event.getActionMasked() == MotionEvent.ACTION_MOVE) {
++                        final float slop = ViewConfiguration.get(getContext()).getScaledTouchSlop();
++                        if (Math.abs(event.getX() - quickAttachmentDownX) > slop || Math.abs(event.getY() - quickAttachmentDownY) > slop) {
++                            if (quickAttachmentLongPress != null) {
++                                removeCallbacks(quickAttachmentLongPress);
++                                quickAttachmentLongPress = null;
++                            }
++                        }
++                    } else if (event.getActionMasked() == MotionEvent.ACTION_UP || event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
++                        if (quickAttachmentLongPress != null) {
++                            removeCallbacks(quickAttachmentLongPress);
++                            quickAttachmentLongPress = null;
++                        }
++                        quickAttachmentLongPressTriggered = false;
++                    }
+                     return super.dispatchTouchEvent(event);
+                 }
+             };
+@@ -2839,12 +2901,28 @@ public class ChatActivityEnterView extends FrameLayout implements
+             attachButton.setBackground(Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector)));
+             messageEditTextContainer.addView(attachButton, LayoutHelper.createFrame(DEFAULT_HEIGHT, DEFAULT_HEIGHT, Gravity.BOTTOM | Gravity.RIGHT));
+             attachButton.setOnClickListener(v -> {
++                if (quickAttachmentSuppressTap) {
++                    quickAttachmentSuppressTap = false;
++                    return;
++                }
+                 if (adjustPanLayoutHelper != null && adjustPanLayoutHelper.animationInProgress() || attachLayoutPaddingAlpha == 0f) {
+                     return;
+                 }
+                 delegate.didPressAttachButton();
+             });
+             attachButton.setContentDescription(getString(R.string.AccDescrAttachButton));
++            // Make the long-press target forgiving without changing the
++            // visible paperclip size or shifting the input layout.
++            messageEditTextContainer.post(() -> {
++                if (attachButton == null || messageEditTextContainer == null) {
++                    return;
++                }
++                Rect hitRect = new Rect();
++                attachButton.getHitRect(hitRect);
++                int extraHitSlop = dp(12);
++                hitRect.inset(-extraHitSlop, -extraHitSlop);
++                messageEditTextContainer.setTouchDelegate(new TouchDelegate(hitRect, attachButton));
++            });
+             updateFieldRight(1);
+         }
+ 
+@@ -3572,6 +3650,116 @@ public class ChatActivityEnterView extends FrameLayout implements
+         createMessageEditText();
+     }
+ 
++    private void showQuickAttachmentOverlay(View sourceView) {
++        if (quickAttachmentOverlay != null || !(getRootView() instanceof ViewGroup)) {
++            return;
++        }
++        ViewGroup root = (ViewGroup) getRootView();
++        int[] sourceLocation = new int[2];
++        int[] rootLocation = new int[2];
++        sourceView.getLocationOnScreen(sourceLocation);
++        root.getLocationOnScreen(rootLocation);
++        final ArrayList<MediaController.PhotoEntry> recentPhotos = new ArrayList<>();
++        if (MediaController.allPhotosAlbumEntry != null) {
++            for (MediaController.PhotoEntry photo : MediaController.allPhotosAlbumEntry.photos) {
++                if (photo != null && photo.path != null && !photo.isVideo) {
++                    recentPhotos.add(photo);
++                    if (recentPhotos.size() == 4) {
++                        break;
++                    }
++                }
++            }
++        }
++        if (recentPhotos.isEmpty()) {
++            // Consume the eventual ACTION_UP so the long-press fallback does
++            // not also trigger the normal click listener.
++            quickAttachmentTracking = true;
++            if (delegate != null) {
++                delegate.didPressAttachButton();
++            }
++            return;
++        }
++        quickAttachmentOverlay = new QuickAttachmentOverlayView(getContext(), photo -> {
++            quickPhotoTransitionPending = true;
++            if (delegate != null) {
++                delegate.didPressQuickPhoto(photo);
++            }
++        }, () -> {
++            quickAttachmentOverlay = null;
++            quickPhotoMessageObject = null;
++            quickPhotoTransitionPending = false;
++        });
++        root.addView(quickAttachmentOverlay, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
++        final float sourceX = sourceLocation[0] - rootLocation[0] + sourceView.getWidth() / 2f;
++        final float sourceY = sourceLocation[1] - rootLocation[1] + sourceView.getHeight() / 2f;
++        // The root may not have performed its first layout yet (for example
++        // directly after opening a chat). Let the overlay calculate its fan
++        // after it has a real size, otherwise the strip can be placed at x=0.
++        quickAttachmentOverlay.post(() -> {
++            if (quickAttachmentOverlay != null) {
++                quickAttachmentOverlay.present(sourceX, sourceY, recentPhotos);
++            }
++        });
++    }
++
++    private void updateQuickAttachmentOverlay(MotionEvent event) {
++        if (quickAttachmentOverlay == null) {
++            return;
++        }
++        View root = getRootView();
++        int[] buttonLocation = new int[2];
++        int[] rootLocation = new int[2];
++        attachButton.getLocationOnScreen(buttonLocation);
++        root.getLocationOnScreen(rootLocation);
++        quickAttachmentOverlay.updateTracking(
++                buttonLocation[0] - rootLocation[0] + event.getX(),
++                buttonLocation[1] - rootLocation[1] + event.getY()
++        );
++    }
++
++    private void finishQuickAttachmentOverlay(MotionEvent event, boolean cancelled) {
++        quickAttachmentTracking = false;
++        if (quickAttachmentLongPress != null) {
++            removeCallbacks(quickAttachmentLongPress);
++            quickAttachmentLongPress = null;
++        }
++        if (quickAttachmentOverlay == null) {
++            return;
++        }
++        View root = getRootView();
++        int[] buttonLocation = new int[2];
++        int[] rootLocation = new int[2];
++        attachButton.getLocationOnScreen(buttonLocation);
++        root.getLocationOnScreen(rootLocation);
++        float x = buttonLocation[0] - rootLocation[0] + event.getX();
++        float y = buttonLocation[1] - rootLocation[1] + event.getY();
++        QuickAttachmentOverlayView overlay = quickAttachmentOverlay;
++        if (cancelled) {
++            overlay.cancelTracking();
++        } else {
++            overlay.finishTracking(x, y);
++        }
++    }
++
++    public boolean tryStartQuickPhotoTransition(ChatMessageCell messageCell) {
++        if (quickAttachmentOverlay == null || messageCell == null) {
++            return false;
++        }
++        boolean started = quickAttachmentOverlay.tryAnimateIntoMessage(messageCell);
++        if (started) {
++            quickPhotoMessageObject = messageCell.getMessageObject();
++        }
++        return started;
++    }
++
++    public boolean shouldSkipQuickPhotoListAnimation(MessageObject messageObject) {
++        return messageObject != null && messageObject == quickPhotoMessageObject;
++    }
++
++    public boolean isQuickPhotoTransitionPending() {
++        return quickPhotoTransitionPending;
++    }
++
+     public void setViewParentForEmoji(ViewGroup viewParent) {
+         viewParentForEmojiView = viewParent;
+     }
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/QuickAttachmentOverlayView.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/QuickAttachmentOverlayView.java
+new file mode 100644
+index 000000000..fc1675ddc
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/QuickAttachmentOverlayView.java
+@@ -0,0 +1,765 @@
++package org.telegram.ui.Components;
++
++import android.animation.Animator;
++import android.animation.AnimatorListenerAdapter;
++import android.animation.ValueAnimator;
++import android.content.Context;
++import android.graphics.RectF;
++import android.view.View;
++import android.view.ViewGroup;
++import android.view.ViewTreeObserver;
++import android.view.animation.LinearInterpolator;
++import android.view.animation.PathInterpolator;
++import android.widget.FrameLayout;
++
++import androidx.dynamicanimation.animation.FloatPropertyCompat;
++import androidx.dynamicanimation.animation.SpringAnimation;
++import androidx.dynamicanimation.animation.SpringForce;
++
++import org.telegram.messenger.AndroidUtilities;
++import org.telegram.messenger.ImageReceiver;
++import org.telegram.messenger.MediaController;
++import org.telegram.messenger.MessageObject;
++import org.telegram.messenger.SharedConfig;
++import org.telegram.ui.ActionBar.Theme;
++import org.telegram.ui.Cells.ChatMessageCell;
++
++import java.util.ArrayList;
++
++/** Long-press photo fan with a sequential cubic launch arc. */
++public class QuickAttachmentOverlayView extends FrameLayout {
++    public interface Callback {
++        void onPhotoSelected(MediaController.PhotoEntry photo);
++    }
++
++    private final View dimView;
++    private final ArrayList<ItemView> items = new ArrayList<>();
++    private final ArrayList<MediaController.PhotoEntry> photos = new ArrayList<>();
++    private final ArrayList<RectF> hitRects = new ArrayList<>();
++    private final Callback callback;
++    private final Runnable onDismissed;
++    private final boolean motionEnabled;
++    private int highlightedIndex = -1;
++    private boolean launchComplete;
++    private boolean hasTrackingPoint;
++    private float lastTrackingX;
++    private float lastTrackingY;
++    private float sourceX;
++    private float sourceY;
++    private boolean dismissed;
++    private boolean presented;
++    private boolean dismissalNotified;
++    private boolean waitingForMessageCell;
++    private boolean messageTransitionStarted;
++    private ItemView selectedItem;
++    private MediaController.PhotoEntry selectedPhoto;
++    private float selectedReleaseCenterX;
++    private float selectedReleaseCenterY;
++    private boolean hasSelectedReleasePosition;
++    private Runnable messageCellTimeout;
++
++    private static final PathInterpolator EASE_OUT = new PathInterpolator(0.16f, 1f, 0.3f, 1f);
++    private static final LinearInterpolator LAUNCH_TIMING = new LinearInterpolator();
++
++    public QuickAttachmentOverlayView(Context context, Callback callback, Runnable onDismissed) {
++        super(context);
++        this.callback = callback;
++        this.onDismissed = onDismissed;
++        motionEnabled = SharedConfig.animationsEnabled();
++        setClipChildren(false);
++        dimView = new View(context);
++        dimView.setBackgroundColor(0x0A000000);
++        dimView.setAlpha(0f);
++        addView(dimView, new FrameLayout.LayoutParams(-1, -1));
++    }
++
++    public void present(float sourceX, float sourceY, ArrayList<MediaController.PhotoEntry> photos) {
++        if (presented || photos == null || photos.isEmpty()) {
++            return;
++        }
++        presented = true;
++        this.sourceX = sourceX;
++        this.sourceY = sourceY;
++        launchComplete = !motionEnabled;
++        this.photos.addAll(photos);
++        if (motionEnabled) {
++            dimView.animate().alpha(1f).setDuration(120).start();
++        } else {
++            dimView.setAlpha(1f);
++        }
++
++        final int sideMargin = AndroidUtilities.dp(12);
++        final int gap = AndroidUtilities.dp(8);
++        final int availableWidth = Math.max(0, getWidth() - sideMargin * 2 - gap * (this.photos.size() - 1));
++        final int size = Math.min(AndroidUtilities.dp(84), availableWidth / this.photos.size());
++        final int stripWidth = size * this.photos.size() + gap * (this.photos.size() - 1);
++        final float left = Math.max(sideMargin, (getWidth() - stripWidth) / 2f);
++        final float top = Math.max(AndroidUtilities.dp(24), sourceY - size - AndroidUtilities.dp(28));
++
++        for (int i = 0; i < this.photos.size(); i++) {
++            ItemView item = new ItemView(getContext(), this.photos.get(i));
++            // allPhotosAlbumEntry is ordered newest-first. Keep that order on
++            // screen as well: the most recent photo always starts on the left.
++            float x = left + i * (size + gap);
++            float y = top;
++            FrameLayout.LayoutParams layoutParams = new FrameLayout.LayoutParams(size, size);
++            layoutParams.leftMargin = Math.round(x);
++            layoutParams.topMargin = Math.round(y);
++            item.setBasePosition(layoutParams.leftMargin, layoutParams.topMargin, size);
++            addView(item, layoutParams);
++            item.setPivotX(size / 2f);
++            item.setPivotY(size / 2f);
++            item.setAlpha(0f);
++            item.setScaleX(0.42f);
++            item.setScaleY(0.42f);
++            item.setTranslationX(sourceX - (x + size / 2f));
++            item.setTranslationY(sourceY - (y + size / 2f));
++            items.add(item);
++            hitRects.add(new RectF(x - AndroidUtilities.dp(12), y - AndroidUtilities.dp(12), x + size + AndroidUtilities.dp(12), y + size + AndroidUtilities.dp(12)));
++
++            final ItemView target = item;
++            if (motionEnabled) {
++                // Launch one thumbnail at a time. The first part of the arc
++                // travels mostly sideways, then bends upward into the strip.
++                postDelayed(() -> {
++                    if (dismissed) return;
++                    animateItemIntoPlace(target, x + size / 2f, y + size / 2f);
++                }, i * 40L);
++            } else {
++                target.setAlpha(1f);
++                target.setScaleX(1f);
++                target.setScaleY(1f);
++                target.setTranslationX(0f);
++                target.setTranslationY(0f);
++            }
++        }
++        performHapticFeedback(android.view.HapticFeedbackConstants.CONTEXT_CLICK);
++    }
++
++    private void animateItemIntoPlace(ItemView item, float targetCenterX, float targetCenterY) {
++        item.cancelEntranceAnimation();
++        final float startCenterX = item.getBaseCenterX() + item.getTranslationX();
++        final float startCenterY = item.getBaseCenterY() + item.getTranslationY();
++        final float deltaX = targetCenterX - startCenterX;
++        final float deltaY = targetCenterY - startCenterY;
++        final float apexY = targetCenterY - AndroidUtilities.dp(12);
++        final float apexStartX = startCenterX + deltaX * 0.78f;
++        final float apexEndX = startCenterX + deltaX * 0.96f;
++        ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
++        animator.setDuration(200);
++        animator.setInterpolator(LAUNCH_TIMING);
++        animator.addUpdateListener(valueAnimator -> {
++            final float t = (float) valueAnimator.getAnimatedValue();
++            final float centerX;
++            final float centerY;
++            if (t < 0.45f) {
++                // 0–45%: fast lift with most of the horizontal travel.
++                final float p = t / 0.45f;
++                centerX = cubic(startCenterX, startCenterX + deltaX * 0.42f, apexStartX - deltaX * 0.14f, apexStartX, p);
++                centerY = cubic(startCenterY, startCenterY + deltaY * 0.52f, apexY - AndroidUtilities.dp(4), apexY, p);
++            } else if (t < 0.60f) {
++                // 45–60%: continue drifting through the apex, with almost
++                // zero vertical velocity (no artificial pause).
++                final float p = (t - 0.45f) / 0.15f;
++                centerX = cubic(apexStartX, apexStartX + deltaX * 0.08f, apexEndX - deltaX * 0.03f, apexEndX, p);
++                centerY = cubic(apexY, apexY, apexY, apexY, p);
++            } else {
++                // 60–100%: fall only a few dp, then ease into the final cell.
++                final float p = (t - 0.60f) / 0.40f;
++                centerX = cubic(apexEndX, apexEndX + deltaX * 0.02f, targetCenterX - deltaX * 0.03f, targetCenterX, p);
++                centerY = cubic(apexY, apexY + AndroidUtilities.dp(3), targetCenterY - AndroidUtilities.dp(2), targetCenterY, p);
++            }
++            item.setTranslationX(centerX - item.getBaseCenterX());
++            item.setTranslationY(centerY - item.getBaseCenterY());
++            final float scale = 0.42f + 0.58f * t;
++            item.setScaleX(scale);
++            item.setScaleY(scale);
++            item.setAlpha(Math.min(1f, t * 4f));
++        });
++        animator.addListener(new AnimatorListenerAdapter() {
++            private boolean cancelled;
++
++            @Override
++            public void onAnimationCancel(Animator animation) {
++                cancelled = true;
++            }
++
++            @Override
++            public void onAnimationEnd(Animator animation) {
++                if (cancelled) {
++                    item.clearEntranceAnimation(animator);
++                    return;
++                }
++                item.setTranslationX(0f);
++                item.setTranslationY(0f);
++                item.setScaleX(1f);
++                item.setScaleY(1f);
++                item.setAlpha(1f);
++                item.clearEntranceAnimation(animator);
++                if (item == items.get(items.size() - 1)) {
++                    launchComplete = true;
++                    if (hasTrackingPoint) {
++                        updateTracking(lastTrackingX, lastTrackingY);
++                    }
++                }
++            }
++        });
++        item.setEntranceAnimation(animator);
++        animator.start();
++    }
++
++    private static float cubic(float p0, float p1, float p2, float p3, float t) {
++        final float oneMinusT = 1f - t;
++        return oneMinusT * oneMinusT * oneMinusT * p0
++                + 3f * oneMinusT * oneMinusT * t * p1
++                + 3f * oneMinusT * t * t * p2
++                + t * t * t * p3;
++    }
++
++    private void animateItemBackToSource(ItemView item, long startDelay) {
++        animateItemBackToSource(item, startDelay, 1f);
++    }
++
++    private void animateItemBackToSource(ItemView item, long startDelay, float travelProgress) {
++        item.cancelEntranceAnimation();
++        final float startCenterX = item.getBaseCenterX() + item.getTranslationX();
++        final float startCenterY = item.getBaseCenterY() + item.getTranslationY();
++        final float deltaX = sourceX - startCenterX;
++        final float deltaY = sourceY - startCenterY;
++        final float targetCenterX = startCenterX + deltaX * travelProgress;
++        final float targetCenterY = startCenterY + deltaY * travelProgress;
++        // These are the entrance controls read in reverse, so the thumbnail
++        // visibly retraces its launch arc back behind the paperclip.
++        final float control1X = startCenterX + deltaX * 0.28f;
++        final float control1Y = startCenterY + deltaY * 0.28f;
++        final float control2X = startCenterX + deltaX * 0.82f;
++        final float control2Y = startCenterY + deltaY * 0.82f;
++        final float startScale = item.getScaleX();
++        final float startAlpha = item.getAlpha();
++        ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
++        animator.setStartDelay(startDelay);
++        animator.setDuration(travelProgress < 1f ? 120 : 190);
++        animator.setInterpolator(EASE_OUT);
++        animator.addUpdateListener(valueAnimator -> {
++            final float t = (float) valueAnimator.getAnimatedValue();
++            final float oneMinusT = 1f - t;
++            final float centerX = oneMinusT * oneMinusT * oneMinusT * startCenterX
++                    + 3f * oneMinusT * oneMinusT * t * control1X
++                    + 3f * oneMinusT * t * t * control2X
++                    + t * t * t * targetCenterX;
++            final float centerY = oneMinusT * oneMinusT * oneMinusT * startCenterY
++                    + 3f * oneMinusT * oneMinusT * t * control1Y
++                    + 3f * oneMinusT * t * t * control2Y
++                    + t * t * t * targetCenterY;
++            item.setTranslationX(centerX - item.getBaseCenterX());
++            item.setTranslationY(centerY - item.getBaseCenterY());
++            final float scale = startScale + (0.42f - startScale) * t;
++            item.setScaleX(scale);
++            item.setScaleY(scale);
++            item.setAlpha(startAlpha * (1f - t));
++        });
++        animator.addListener(new AnimatorListenerAdapter() {
++            @Override
++            public void onAnimationEnd(Animator animation) {
++                item.setTranslationX(targetCenterX - item.getBaseCenterX());
++                item.setTranslationY(targetCenterY - item.getBaseCenterY());
++                item.setScaleX(0.42f);
++                item.setScaleY(0.42f);
++                item.setAlpha(0f);
++                item.clearEntranceAnimation(animator);
++            }
++        });
++        item.setEntranceAnimation(animator);
++        animator.start();
++    }
++
++    public void updateTracking(float x, float y) {
++        lastTrackingX = x;
++        lastTrackingY = y;
++        hasTrackingPoint = true;
++        if (!launchComplete) {
++            return;
++        }
++        int next = indexAt(x, y);
++        if (next == highlightedIndex) return;
++        if (next >= 0) performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP);
++        highlightedIndex = next;
++        for (int i = 0; i < items.size(); i++) {
++            ItemView item = items.get(i);
++            boolean selected = i == next;
++            item.cancelEntranceAnimation();
++            item.cancelScaleSprings();
++            item.animate().cancel();
++            if (motionEnabled) {
++                item.animate().scaleX(selected ? 1.10f : 1f).scaleY(selected ? 1.10f : 1f).alpha(next < 0 || selected ? 1f : 0.85f).setDuration(140).setInterpolator(EASE_OUT).start();
++            } else {
++                item.setScaleX(selected ? 1.10f : 1f);
++                item.setScaleY(selected ? 1.10f : 1f);
++                item.setAlpha(next < 0 || selected ? 1f : 0.85f);
++            }
++            if (selected) item.bringToFront();
++        }
++    }
++
++    public void finishTracking(float x, float y) {
++        if (dismissed) return;
++        int selected = indexAt(x, y);
++        dismissed = true;
++        if (selected >= 0 && selected < photos.size() && callback != null) {
++            selectedPhoto = photos.get(selected);
++            selectedItem = items.get(selected);
++            selectedReleaseCenterX = selectedItem.getBaseCenterX() + selectedItem.getTranslationX();
++            selectedReleaseCenterY = selectedItem.getBaseCenterY() + selectedItem.getTranslationY();
++            hasSelectedReleasePosition = true;
++            waitingForMessageCell = true;
++            callback.onPhotoSelected(selectedPhoto);
++        }
++        if (!motionEnabled) {
++            removeFromParent();
++            return;
++        }
++        dimView.animate().alpha(0f).setDuration(140).start();
++        for (int i = 0; i < items.size(); i++) {
++            ItemView item = items.get(i);
++            final boolean isSelectedItem = i == selected;
++            item.cancelEntranceAnimation();
++            item.cancelSprings();
++            item.animate().cancel();
++            if (isSelectedItem) {
++                item.setAlpha(1f);
++            } else if (selected >= 0) {
++                final long delay = (items.size() - i - 1) * 18L;
++                animateItemBackToSource(item, delay, 0.45f);
++            } else {
++                // Cancellation folds the fan back into the paperclip in the
++                // reverse of its reveal order.
++                final long delay = (items.size() - i - 1) * 22L;
++                animateItemBackToSource(item, delay);
++            }
++        }
++        if (selected >= 0) {
++            postDelayed(messageCellTimeout = () -> {
++                messageCellTimeout = null;
++                if (waitingForMessageCell && !messageTransitionStarted && this.selectedItem != null) {
++                    waitingForMessageCell = false;
++                    animateSelectedToOutgoingMessage(this.selectedItem);
++                }
++            }, 1200);
++        } else {
++            postDelayed(this::removeFromParent, 150 + Math.max(0, items.size() - 1) * 22L + 30L);
++        }
++    }
++
++    public void cancelTracking() {
++        finishTracking(-1000, -1000);
++    }
++
++    private int indexAt(float x, float y) {
++        for (int i = 0; i < hitRects.size(); i++) {
++            if (hitRects.get(i).contains(x, y)) return i;
++        }
++        return -1;
++    }
++
++    public boolean tryAnimateIntoMessage(ChatMessageCell messageCell) {
++        if (!waitingForMessageCell || messageTransitionStarted || selectedItem == null || selectedPhoto == null || messageCell == null) {
++            return false;
++        }
++        MessageObject messageObject = messageCell.getMessageObject();
++        if (messageObject == null || messageObject.type != MessageObject.TYPE_PHOTO || !messageObject.isOutOwner()
++                || messageObject.messageOwner == null
++                || (!messageObject.isSending() && messageObject.messageOwner.id >= 0)) {
++            return false;
++        }
++        messageTransitionStarted = true;
++        waitingForMessageCell = false;
++        if (messageCellTimeout != null) {
++            removeCallbacks(messageCellTimeout);
++            messageCellTimeout = null;
++        }
++        final MessageObject expectedMessage = messageObject;
++        messageCell.getViewTreeObserver().addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
++            @Override
++            public boolean onPreDraw() {
++                messageCell.getViewTreeObserver().removeOnPreDrawListener(this);
++                if (messageCell.getMessageObject() != expectedMessage || getParent() == null) {
++                    messageTransitionStarted = false;
++                    animateSelectedToOutgoingMessage(selectedItem);
++                    return true;
++                }
++                animateSelectedIntoMessageCell(selectedItem, messageCell);
++                return true;
++            }
++        });
++        return true;
++    }
++
++    private void animateSelectedIntoMessageCell(ItemView item, ChatMessageCell messageCell) {
++        final ImageReceiver imageReceiver = messageCell.getPhotoImage();
++        if (imageReceiver == null || imageReceiver.getImageWidth() <= 0 || imageReceiver.getImageHeight() <= 0) {
++            animateSelectedToOutgoingMessage(item);
++            return;
++        }
++
++        final int[] cellPosition = new int[2];
++        final int[] overlayPosition = new int[2];
++        messageCell.getLocationOnScreen(cellPosition);
++        getLocationOnScreen(overlayPosition);
++        final float targetLeft = cellPosition[0] - overlayPosition[0] + imageReceiver.getImageX() - messageCell.getAnimationOffsetX();
++        final float targetTop = cellPosition[1] - overlayPosition[1] + imageReceiver.getImageY() + messageCell.getPaddingTop() - messageCell.getTranslationY();
++        final float targetWidth = imageReceiver.getImageWidth();
++        final float targetHeight = imageReceiver.getImageHeight();
++        shiftOldMessagesForCell(messageCell);
++        final float originalCellScaleX = messageCell.getScaleX();
++        final float originalCellScaleY = messageCell.getScaleY();
++        final float originalCellTranslationY = messageCell.getTranslationY();
++        final float originalPivotX = messageCell.getPivotX();
++        final float originalPivotY = messageCell.getPivotY();
++        final float bubbleStartScale = 0.20f;
++
++        imageReceiver.setAlpha(0f);
++        messageCell.setPivotX(messageCell.getMeasuredWidth() / 2f);
++        messageCell.setPivotY(messageCell.getMeasuredHeight());
++        messageCell.setScaleX(originalCellScaleX * bubbleStartScale);
++        messageCell.setScaleY(originalCellScaleY * bubbleStartScale);
++        messageCell.invalidate();
++        if (!motionEnabled) {
++            imageReceiver.setAlpha(1f);
++            messageCell.setScaleX(originalCellScaleX);
++            messageCell.setScaleY(originalCellScaleY);
++            messageCell.setPivotX(originalPivotX);
++            messageCell.setPivotY(originalPivotY);
++            messageCell.invalidate();
++            removeFromParent();
++            return;
++        }
++
++        final float startCenterX = hasSelectedReleasePosition
++                ? selectedReleaseCenterX : item.getBaseCenterX() + item.getTranslationX();
++        final float startCenterY = hasSelectedReleasePosition
++                ? selectedReleaseCenterY : item.getBaseCenterY() + item.getTranslationY();
++        final float targetCenterX = targetLeft + targetWidth / 2f;
++        final float targetCenterY = targetTop + targetHeight / 2f;
++        // Cubic path: the first control point is far to the right with only
++        // a shallow rise; the second sits below the destination so the final
++        // velocity is predominantly upward, with a soft inertial settle.
++        final float deltaX = targetCenterX - startCenterX;
++        final float deltaY = targetCenterY - startCenterY;
++        final float control1X = startCenterX + deltaX * 0.78f;
++        final float control1Y = startCenterY + deltaY * 0.12f;
++        final float control2X = targetCenterX - deltaX * 0.10f;
++        final float control2Y = targetCenterY - deltaY * 0.22f;
++        // The flight starts from the thumbnail's original size, not from the
++        // temporary 110% hover state used while tracking the finger.
++        item.setScaleX(1f);
++        item.setScaleY(1f);
++        final float startScaleX = 1f;
++        final float startScaleY = 1f;
++        final float targetScaleX = targetWidth / item.getItemSize();
++        final float targetScaleY = targetHeight / item.getItemSize();
++
++        ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
++        animator.setDuration(200);
++        animator.setInterpolator(EASE_OUT);
++        animator.addUpdateListener(valueAnimator -> {
++            final float t = (float) valueAnimator.getAnimatedValue();
++            final float oneMinusT = 1f - t;
++            final float centerX = oneMinusT * oneMinusT * oneMinusT * startCenterX
++                    + 3f * oneMinusT * oneMinusT * t * control1X
++                    + 3f * oneMinusT * t * t * control2X
++                    + t * t * t * targetCenterX;
++            final float centerY = oneMinusT * oneMinusT * oneMinusT * startCenterY
++                    + 3f * oneMinusT * oneMinusT * t * control1Y
++                    + 3f * oneMinusT * t * t * control2Y
++                    + t * t * t * targetCenterY;
++            item.setTranslationX(centerX - item.getBaseCenterX());
++            item.setTranslationY(centerY - item.getBaseCenterY());
++            item.setScaleX(startScaleX + (targetScaleX - startScaleX) * t);
++            item.setScaleY(startScaleY + (targetScaleY - startScaleY) * t);
++            final float bubbleScale = bubbleStartScale + (1f - bubbleStartScale) * t;
++            messageCell.setScaleX(originalCellScaleX * bubbleScale);
++            messageCell.setScaleY(originalCellScaleY * bubbleScale);
++            final float crossfade = t < 0.82f ? 0f : (t - 0.82f) / 0.18f;
++            item.setAlpha(1f - crossfade);
++            imageReceiver.setAlpha(crossfade);
++            messageCell.invalidate();
++        });
++        animator.addListener(new AnimatorListenerAdapter() {
++            private boolean completed;
++
++            private void complete(boolean landed) {
++                if (completed) return;
++                completed = true;
++                imageReceiver.setAlpha(1f);
++                messageCell.setScaleX(originalCellScaleX);
++                messageCell.setScaleY(originalCellScaleY);
++                messageCell.setPivotX(originalPivotX);
++                messageCell.setPivotY(originalPivotY);
++                messageCell.invalidate();
++                if (landed) {
++                    playLandingBounce(messageCell, originalCellScaleX, originalCellScaleY, originalCellTranslationY);
++                } else {
++                    removeFromParent();
++                }
++            }
++
++            @Override
++            public void onAnimationCancel(Animator animation) {
++                complete(false);
++            }
++
++            @Override
++            public void onAnimationEnd(Animator animation) {
++                complete(true);
++            }
++        });
++        animator.start();
++    }
++
++    private void playLandingBounce(ChatMessageCell messageCell, float originalScaleX, float originalScaleY, float originalTranslationY) {
++        ValueAnimator bounce = ValueAnimator.ofFloat(0f, 1f);
++        bounce.setDuration(120);
++        bounce.setInterpolator(EASE_OUT);
++        bounce.addUpdateListener(valueAnimator -> {
++            final float t = (float) valueAnimator.getAnimatedValue();
++            final float bump = t < 0.42f ? t / 0.42f : 1f - (t - 0.42f) / 0.58f;
++            messageCell.setTranslationY(originalTranslationY - AndroidUtilities.dp(2) * bump);
++            messageCell.setScaleX(originalScaleX * (1f + 0.006f * bump));
++            messageCell.setScaleY(originalScaleY * (1f + 0.012f * bump));
++            messageCell.invalidate();
++        });
++        bounce.addListener(new AnimatorListenerAdapter() {
++            @Override
++            public void onAnimationEnd(Animator animation) {
++                messageCell.setTranslationY(originalTranslationY);
++                messageCell.setScaleX(originalScaleX);
++                messageCell.setScaleY(originalScaleY);
++                messageCell.invalidate();
++                removeFromParent();
++            }
++        });
++        bounce.start();
++    }
++
++    private void shiftOldMessagesForCell(ChatMessageCell messageCell) {
++        if (!(messageCell.getParent() instanceof ViewGroup)) {
++            return;
++        }
++        ViewGroup parent = (ViewGroup) messageCell.getParent();
++        final int messageTop = Math.round(messageCell.getTop() + messageCell.getTranslationY());
++        int previousBottom = Integer.MIN_VALUE;
++        for (int i = 0; i < parent.getChildCount(); i++) {
++            View child = parent.getChildAt(i);
++            if (child instanceof ChatMessageCell && child != messageCell
++                    && child.getBottom() <= messageTop + AndroidUtilities.dp(4)) {
++                previousBottom = Math.max(previousBottom, Math.round(child.getBottom() + child.getTranslationY()));
++            }
++        }
++        if (previousBottom == Integer.MIN_VALUE) {
++            return;
++        }
++        final int overlap = previousBottom + AndroidUtilities.dp(8) - messageTop;
++        if (overlap <= 0) {
++            return;
++        }
++        for (int i = 0; i < parent.getChildCount(); i++) {
++            View child = parent.getChildAt(i);
++            if (child instanceof ChatMessageCell && child != messageCell
++                    && child.getBottom() <= messageTop + AndroidUtilities.dp(4)) {
++                child.animate()
++                        .translationY(child.getTranslationY() - overlap)
++                        .setDuration(140)
++                        .setInterpolator(EASE_OUT)
++                        .start();
++            }
++        }
++    }
++
++    private void animateSelectedToOutgoingMessage(ItemView item) {
++        final float startCenterX = item.getBaseCenterX() + item.getTranslationX();
++        final float startCenterY = item.getBaseCenterY() + item.getTranslationY();
++        final float targetScale = 1.35f;
++        final float targetCenterX = getWidth() - AndroidUtilities.dp(14) - item.getItemSize() * targetScale / 2f;
++        final float targetCenterY = sourceY - AndroidUtilities.dp(36) - item.getItemSize() * targetScale / 2f;
++        final float deltaX = targetCenterX - startCenterX;
++        final float deltaY = targetCenterY - startCenterY;
++        final float control1X = startCenterX + deltaX * 0.78f;
++        final float control1Y = startCenterY + deltaY * 0.12f;
++        final float control2X = targetCenterX - deltaX * 0.10f;
++        final float control2Y = targetCenterY - deltaY * 0.22f;
++
++        ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
++        animator.setDuration(300);
++        animator.setInterpolator(EASE_OUT);
++        animator.addUpdateListener(valueAnimator -> {
++            final float t = (float) valueAnimator.getAnimatedValue();
++            final float oneMinusT = 1f - t;
++            final float centerX = oneMinusT * oneMinusT * oneMinusT * startCenterX
++                    + 3f * oneMinusT * oneMinusT * t * control1X
++                    + 3f * oneMinusT * t * t * control2X
++                    + t * t * t * targetCenterX;
++            final float centerY = oneMinusT * oneMinusT * oneMinusT * startCenterY
++                    + 3f * oneMinusT * oneMinusT * t * control1Y
++                    + 3f * oneMinusT * t * t * control2Y
++                    + t * t * t * targetCenterY;
++            item.setTranslationX(centerX - item.getBaseCenterX());
++            item.setTranslationY(centerY - item.getBaseCenterY());
++            final float scale = item.getStartScale() + (targetScale - item.getStartScale()) * t;
++            item.setScaleX(scale);
++            item.setScaleY(scale);
++            item.setAlpha(t < 0.82f ? 1f : 1f - (t - 0.82f) / 0.18f);
++        });
++        animator.addListener(new AnimatorListenerAdapter() {
++            @Override
++            public void onAnimationEnd(Animator animation) {
++                removeFromParent();
++            }
++        });
++        item.captureStartScale();
++        animator.start();
++    }
++
++    private void removeFromParent() {
++        if (messageCellTimeout != null) {
++            removeCallbacks(messageCellTimeout);
++            messageCellTimeout = null;
++        }
++        ViewGroup parent = (ViewGroup) getParent();
++        if (parent != null) parent.removeView(this);
++        if (!dismissalNotified) {
++            dismissalNotified = true;
++            if (onDismissed != null) onDismissed.run();
++        }
++    }
++
++    private static SpringAnimation spring(View target, DynamicProperty property, float finalPosition, float stiffness, float dampingRatio) {
++        SpringAnimation animation = new SpringAnimation(target, property);
++        SpringForce force = new SpringForce(finalPosition);
++        force.setStiffness(stiffness);
++        force.setDampingRatio(dampingRatio);
++        animation.setSpring(force);
++        return animation;
++    }
++
++    private static final DynamicProperty TRANSLATION_X = new DynamicProperty("translationX") {
++        @Override public float getValue(View view) { return view.getTranslationX(); }
++        @Override public void setValue(View view, float value) { view.setTranslationX(value); }
++    };
++
++    private static final DynamicProperty TRANSLATION_Y = new DynamicProperty("translationY") {
++        @Override public float getValue(View view) { return view.getTranslationY(); }
++        @Override public void setValue(View view, float value) { view.setTranslationY(value); }
++    };
++
++    private static final DynamicProperty SCALE_X = new DynamicProperty("scaleX") {
++        @Override public float getValue(View view) { return view.getScaleX(); }
++        @Override public void setValue(View view, float value) { view.setScaleX(value); }
++    };
++
++    private static final DynamicProperty SCALE_Y = new DynamicProperty("scaleY") {
++        @Override public float getValue(View view) { return view.getScaleY(); }
++        @Override public void setValue(View view, float value) { view.setScaleY(value); }
++    };
++
++    private abstract static class DynamicProperty extends FloatPropertyCompat<View> {
++        DynamicProperty(String name) { super(name); }
++    }
++
++    private static class ItemView extends FrameLayout {
++        private ValueAnimator entranceAnimator;
++        private SpringAnimation translationXSpring;
++        private SpringAnimation translationYSpring;
++        private SpringAnimation scaleXSpring;
++        private SpringAnimation scaleYSpring;
++        private float startScale = 1f;
++        private float baseX;
++        private float baseY;
++        private float itemSize;
++
++        ItemView(Context context, MediaController.PhotoEntry photo) {
++            super(context);
++            setClipChildren(false);
++            BackupImageView image = new BackupImageView(context);
++            image.setRoundRadius(AndroidUtilities.dp(16));
++            image.setOrientation(photo.orientation, photo.invert, true);
++            if (photo.thumbPath != null) {
++                image.setImage(photo.thumbPath, null, Theme.chat_attachEmptyDrawable);
++            } else {
++                image.setImage("thumb://" + photo.imageId + ":" + photo.path, null, Theme.chat_attachEmptyDrawable);
++            }
++            addView(image, new FrameLayout.LayoutParams(-1, -1));
++        }
++
++        void setBasePosition(float baseX, float baseY, float itemSize) {
++            this.baseX = baseX;
++            this.baseY = baseY;
++            this.itemSize = itemSize;
++        }
++
++        float getBaseCenterX() {
++            return baseX + itemSize / 2f;
++        }
++
++        float getBaseCenterY() {
++            return baseY + itemSize / 2f;
++        }
++
++        float getItemSize() {
++            return itemSize;
++        }
++
++        void startSpring(DynamicProperty property, float finalPosition, float stiffness, float dampingRatio) {
++            SpringAnimation animation = spring(this, property, finalPosition, stiffness, dampingRatio);
++            if (property == QuickAttachmentOverlayView.TRANSLATION_X) {
++                if (translationXSpring != null) translationXSpring.cancel();
++                translationXSpring = animation;
++            } else if (property == QuickAttachmentOverlayView.TRANSLATION_Y) {
++                if (translationYSpring != null) translationYSpring.cancel();
++                translationYSpring = animation;
++            } else if (property == QuickAttachmentOverlayView.SCALE_X) {
++                if (scaleXSpring != null) scaleXSpring.cancel();
++                scaleXSpring = animation;
++            } else if (property == QuickAttachmentOverlayView.SCALE_Y) {
++                if (scaleYSpring != null) scaleYSpring.cancel();
++                scaleYSpring = animation;
++            }
++            animation.start();
++        }
++
++        void setEntranceAnimation(ValueAnimator animator) {
++            entranceAnimator = animator;
++        }
++
++        void clearEntranceAnimation(ValueAnimator animator) {
++            if (entranceAnimator == animator) {
++                entranceAnimator = null;
++            }
++        }
++
++        void cancelEntranceAnimation() {
++            if (entranceAnimator != null) {
++                entranceAnimator.cancel();
++                entranceAnimator = null;
++            }
++        }
++
++        void cancelScaleSprings() {
++            if (scaleXSpring != null) scaleXSpring.cancel();
++            if (scaleYSpring != null) scaleYSpring.cancel();
++        }
++
++        void cancelSprings() {
++            if (translationXSpring != null) translationXSpring.cancel();
++            if (translationYSpring != null) translationYSpring.cancel();
++            cancelScaleSprings();
++        }
++
++        void captureStartScale() {
++            startScale = getScaleX();
++        }
++
++        float getStartScale() {
++            return startScale;
++        }
++    }
++}
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/recyclerview/ChatListItemAnimator.java b/TMessagesProj/src/main/java/org/telegram/ui/recyclerview/ChatListItemAnimator.java
+index 27b589ba1..f8bb5a849 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/recyclerview/ChatListItemAnimator.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/recyclerview/ChatListItemAnimator.java
+@@ -324,6 +324,15 @@ public class ChatListItemAnimator extends DefaultItemAnimator {
+ 
+     @Override
+     public boolean animateAdd(RecyclerView.ViewHolder holder) {
++        if (activity != null && holder.itemView instanceof ChatMessageCell
++                && activity.getChatActivityEnterView() != null
++                && activity.getChatActivityEnterView().shouldSkipQuickPhotoListAnimation(((ChatMessageCell) holder.itemView).getMessageObject())) {
++            holder.itemView.setAlpha(1f);
++            holder.itemView.setScaleX(1f);
++            holder.itemView.setScaleY(1f);
++            holder.itemView.setTranslationY(0f);
++            return false;
++        }
+         resetAnimation(holder);
+         holder.itemView.setAlpha(0);
+         if (!shouldAnimateEnterFromBottom) {
+@@ -978,6 +987,11 @@ public class ChatListItemAnimator extends DefaultItemAnimator {
+ 
+         if (withThanos) {
+             animatorSet.setInterpolator(CubicBezierInterpolator.EASE_OUT);
++        } else if (activity != null && activity.getChatActivityEnterView() != null
++                && activity.getChatActivityEnterView().isQuickPhotoTransitionPending()) {
++            // Let the conversation make room slightly before the thumbnail
++            // reaches its final cell, avoiding a late, visible shove.
++            animatorSet.setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT);
+         } else if (translationInterpolator != null) {
+             animatorSet.setInterpolator(translationInterpolator);
+         }
+@@ -1628,6 +1642,10 @@ public class ChatListItemAnimator extends DefaultItemAnimator {
+ 
+     @Override
+     public long getMoveDuration() {
++        if (activity != null && activity.getChatActivityEnterView() != null
++                && activity.getChatActivityEnterView().isQuickPhotoTransitionPending()) {
++            return 180;
++        }
+         return DEFAULT_DURATION;
+     }
+ 
