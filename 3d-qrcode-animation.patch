@@ -1,0 +1,130 @@
+From cbb87d7ea8f474f54a9b544e48896ac50ce4bc26 Mon Sep 17 00:00:00 2001
+From: col3name <mmikushov@instaloper.com>
+Date: Sun, 8 Nov 2026 21:47:00 +0300
+Subject: [PATCH] feat: added 3D animation to QR code sharing
+
+---
+ .../org/telegram/ui/QrShare/QrShareView.java  | 68 +++++++++++++++++++
+ 1 file changed, 68 insertions(+)
+
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/QrShare/QrShareView.java b/TMessagesProj/src/main/java/org/telegram/ui/QrShare/QrShareView.java
+index c2a57a19b..267e28cbc 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/QrShare/QrShareView.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/QrShare/QrShareView.java
+@@ -7,6 +7,7 @@ import static org.telegram.messenger.AndroidUtilities.lerp;
+ import android.content.Context;
+ import android.graphics.Bitmap;
+ import android.graphics.Canvas;
++import android.graphics.Camera;
+ import android.graphics.Matrix;
+ import android.graphics.Color;
+ import android.graphics.ColorFilter;
+@@ -3681,10 +3682,30 @@ public class QrShareView extends View {
+             else if (u > 0f) cs *= 1f - 0.03f * (float) Math.sin(Math.PI * u) * (1f - u * 0.3f);
+         }
+         c.scale(cs, cs, w / 2f, cardTop() + cardH() / 2f);
++        if (!sharing && reveal >= 1f) {
++            // The card follows the finger first, then settles back to the device tilt. Sharing stays front-on.
++            final float pivotX = w / 2f;
++            final float pivotY = cardTop() + cardH() / 2f;
++            cardCamera.save();
++            cardCamera.setLocation(0f, 0f, -12f);
++            cardCamera.rotateX(cardTiltX);
++            cardCamera.rotateY(cardTiltY);
++            cardCamera.getMatrix(cardPerspective);
++            cardCamera.restore();
++            cardPerspective.preTranslate(-pivotX, -pivotY);
++            cardPerspective.postTranslate(pivotX, pivotY);
++            c.concat(cardPerspective);
++        }
+         drawCardInner(c, w);
+         c.restore();
+     }
+ 
++    private static final float CARD_TILT_MAX_DEGREES = 10f;
++    private final Camera cardCamera = new Camera();
++    private final Matrix cardPerspective = new Matrix();
++    private float cardTiltX, cardTiltY, cardTouchTargetX, cardTouchTargetY;
++    private boolean cardTouchActive;
++
+     // the card's shadow: the blurred rounded rect rendered once on the CPU as an alpha mask, a quarter of the screen
+     // resolution (a 24dp blur is smooth: upscaled, it looks the same), coloured on the CPU whenever the code colour
+     // changes and drawn as a plain bitmap in 9 slices (the corners as they are, the sides stretched): no blur on the
+@@ -4901,6 +4922,8 @@ public class QrShareView extends View {
+         removeCallbacks(prewarmGiftsRunnable);
+         if (sensors != null) sensors.unregisterListener(gravityListener);
+         haveG = false;
++        cardTouchActive = false;
++        cardTouchTargetX = cardTouchTargetY = cardTiltX = cardTiltY = 0f;
+         // detached mid-press (no UP / CANCEL): no wave may wait for the next attach
+         pressedRipple = -1;
+         java.util.Arrays.fill(releaseT, 0);
+@@ -4972,6 +4995,14 @@ public class QrShareView extends View {
+         final float k = 1f - (float) Math.exp(-dt / 0.08f);
+         rawTiltX += (tx - rawTiltX) * k;
+         rawTiltY += (ty - rawTiltY) * k;
++        final float cardTargetX = cardTouchActive ? cardTouchTargetX : -rawTiltY * CARD_TILT_MAX_DEGREES;
++        final float cardTargetY = cardTouchActive ? cardTouchTargetY : rawTiltX * CARD_TILT_MAX_DEGREES;
++        final float cardK = 1f - (float) Math.exp(-dt / 0.09f);
++        cardTiltX += (cardTargetX - cardTiltX) * cardK;
++        cardTiltY += (cardTargetY - cardTiltY) * cardK;
++        if (!cardTouchActive && Math.abs(cardTiltX) < 0.02f && Math.abs(cardTiltY) < 0.02f) {
++            cardTiltX = cardTiltY = 0f;
++        }
+         // 0.5° rotation / 0.5% balance steps
+         final float degStep = RimTune.v[RimTune.TILT_DEG] > 0 ? 0.5f / RimTune.v[RimTune.TILT_DEG] : 1f;
+         tiltX = Math.round(rawTiltX / degStep) * degStep;
+@@ -6636,6 +6667,7 @@ public class QrShareView extends View {
+     @Override
+     public boolean onTouchEvent(MotionEvent e) {
+         final float x = e.getX(), y = e.getY();
++        updateCardTouchTilt(e, x, y);
+         if (e.getActionMasked() == MotionEvent.ACTION_DOWN) toastActionDown = hitToastAction(x, y);
+         if (toastActionDown) { // the toast's action ("Subscribe") takes the whole gesture
+             if (e.getActionMasked() == MotionEvent.ACTION_UP) {
+@@ -6781,6 +6813,42 @@ public class QrShareView extends View {
+         return super.onTouchEvent(e);
+     }
+ 
++    /** The card follows the finger while it is pressed; this is observational and never consumes the gesture. */
++    private void updateCardTouchTilt(MotionEvent event, float x, float y) {
++        switch (event.getActionMasked()) {
++            case MotionEvent.ACTION_DOWN:
++                cardTouchActive = reveal >= 1f && sheet < 0.5f && menu < 0.5f
++                    && x >= getWidth() / 2f - cardW() / 2f && x <= getWidth() / 2f + cardW() / 2f
++                    && y >= cardTop() && y <= cardTop() + cardH();
++                if (cardTouchActive) {
++                    updateCardTouchTarget(x, y);
++                    invalidate();
++                }
++                break;
++            case MotionEvent.ACTION_MOVE:
++                if (cardTouchActive) {
++                    updateCardTouchTarget(x, y);
++                    invalidate();
++                }
++                break;
++            case MotionEvent.ACTION_UP:
++            case MotionEvent.ACTION_CANCEL:
++                if (cardTouchActive) {
++                    cardTouchActive = false;
++                    invalidate();
++                }
++                break;
++        }
++    }
++
++    private void updateCardTouchTarget(float x, float y) {
++        final float nx = Math.max(-1f, Math.min(1f, (x - getWidth() / 2f) / Math.max(1f, cardW() / 2f)));
++        final float ny = Math.max(-1f, Math.min(1f, (y - (cardTop() + cardH() / 2f)) / Math.max(1f, cardH() / 2f)));
++        // Move the near edge toward the finger, like a shallow physical card tilt.
++        cardTouchTargetX = -ny * CARD_TILT_MAX_DEGREES;
++        cardTouchTargetY = nx * CARD_TILT_MAX_DEGREES;
++    }
++
+     private void releaseStretch() {
+         if (stretchX == 0f && stretchY == 0f) return;
+         springX = stretchX;
+-- 
+2.44.0
+
