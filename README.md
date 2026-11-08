@@ -8,7 +8,7 @@ Telegram concept for and **Android** (Java, Telegram-Android), built on top of t
 
 | Android | 3D QR Code | Animation |
 |:---:|:---:|:---:|
-| [Watch Demo](docs/videos/demo.mp4) | <img src="docs/images/3d-monk-1.png" width="60%"> | <img src="docs/images/3d-monk-2.png" width="60%"> |
+| [Watch Demo](docs/videos/demo.gif) | <img src="docs/images/3d-monk-1.png" width="60%"> | <img src="docs/images/3d-monk-2.png" width="60%"> |
 
 
 
