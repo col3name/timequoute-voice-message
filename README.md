@@ -6,9 +6,30 @@ The profile sharing screen displays the QR code on a virtual card. Touching the 
 
 Telegram concept for and **Android** (Java, Telegram-Android), built on top of the official sources.
 
-| Android | 3D QR Code | Animation |
-|:---:|:---:|:---:|
-| [Watch Demo](docs/videos/demo.gif) | <img src="docs/images/3d-monk-1.png" width="60%"> | <img src="docs/images/3d-monk-2.png" width="60%"> |
+<table>
+  <tr>
+    <th>Android</th>
+    <th>3D QR Code</th>
+    <th>Animation</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="docs/videos/demo.gif">Demo 15fps GIF</a>
+    </td>
+    <td rowspan="2" align="center">
+      <img src="docs/images/3d-monk-1.png" width="60%">
+    </td>
+    <td rowspan="2" align="center">
+      <img src="docs/images/3d-monk-2.png" width="60%">
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="docs/videos/demo.mp4">Watch Demo MP4</a>
+    </td>
+  </tr>
+</table>
+
 
 
 
